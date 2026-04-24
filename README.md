@@ -4,6 +4,25 @@ linking to external resources instead of including content in-line.
 See 'release/text/readme.html' for the end user read-me.
 -->
 
+# 🚀 Wiggle 2 (Blender 5.0 Patched)
+
+**This is a maintenance fork of the original [Wiggle 2](https://github.com) by shteeve3d.**
+
+### 🌟 Key Updates for 5.0
+- **Blender 5.0 Compatibility**: Fixed API issues related to the new animation system and bone data handling.
+- **Modular Extension Format**: Converted the single-file addon into a modern Blender Extension structure with `blender_manifest.toml`.
+- **Multi-Bone Property Sync**: Added a feature that allows you to toggle checkboxes and update properties for **all selected bones at once**.
+- **UI & Performance**: Optimized for the latest Blender UI standards and fixed edge cases for rendering.
+
+### 🛠 How to Install
+1. Download this repository as a ZIP.
+2. In Blender 5.0, go to `Edit > Preferences > Get Extensions`.
+3. Click the menu icon (top right) and select **Install from Disk**.
+4. Select the `Wiggle2` folder (or the ZIP containing it).
+
+---
+
+
 # Wiggle 2
 
 Wiggle 2 is a ground up rewrite of the [wiggle bones add-on](https://github.com/shteeve3d/blender-wiggle) for Blender.
