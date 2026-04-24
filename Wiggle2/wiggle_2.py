@@ -62,41 +62,50 @@ def build_list():
 
         
 def update_prop(self, context, prop):
-    # 1. 무한 루프 방지 (하나를 바꿀 때 다른 본들을 건드려 update가 연쇄 호출되는 것 방지)
+    # 1. 무한 루프 방지
     if context.scene.get("wiggle_updating"):
         return
     
-    # 2. 변경된 본의 실제 값 가져오기
+    # 2. 속성값 미리 확보
     val = getattr(self, prop)
-    
-    # 업데이트 시작 플래그 설정
     context.scene["wiggle_updating"] = True
     
     try:
-        # 3. PoseBone인 경우 선택된 모든 본에 값 전파
         if isinstance(self, bpy.types.PoseBone):
-            for b in context.selected_pose_bones:
-                # 이미 바뀐 자기 자신은 제외하고 나머지 본들에 값 대입
+            selected_bones = context.selected_pose_bones
+            
+            # 3. 값 전파 루프 (최대한 가볍게)
+            for b in selected_bones:
                 if b != self:
-                    setattr(b, prop, val)
-                
-                # 특정 속성(head/tail 등) 변경 시 필요한 초기화 로직 실행
-                if prop in ['wiggle_head', 'wiggle_tail']:
-                    # 기존 코드의 reset_bone(b) 호출 유지
-                    if 'reset_bone' in globals():
-                        reset_bone(b)
+                    # 속도 향상을 위한 직접 대입 시도
+                    if prop in b:
+                        b[prop] = val
+                    else:
+                        setattr(b, prop, val)
 
-        # 4. UI 및 내부 리스트 갱신 (루프 밖에서 한 번만 실행하여 성능 확보)
+            # 4. 무거운 초기화 로직은 필요할 때만 실행
+            if prop in ['wiggle_head', 'wiggle_tail']:
+                # globals()에서 함수 존재 여부 확인 후 실행
+                rb = globals().get('reset_bone')
+                if rb:
+                    for b in selected_bones:
+                        rb(b)
+
+        # 5. UI 및 리스트 갱신
         if prop in ['wiggle_mute', 'wiggle_enable', 'wiggle_head', 'wiggle_tail']:
-            if 'build_list' in globals():
-                build_list()
+            bl = globals().get('build_list')
+            if bl:
+                bl()
 
     finally:
-        # 작업 완료 후 플래그 해제
+        # 6. 플래그 해제
         context.scene["wiggle_updating"] = False
-        # edge case 처리 유지: 유저가 설정을 건드리면 렌더링 고정 상태 해제
-        if hasattr(context.scene.wiggle, "is_rendering"):
-            context.scene.wiggle.is_rendering = False
+        
+        # 7. 핵심 최적화: 불필요한 Redraw 방지
+        ws = getattr(context.scene, "wiggle", None)
+        if ws and hasattr(ws, "is_rendering"):
+            if ws.is_rendering: # True일 때만 False로 바꿈
+                ws.is_rendering = False
 
 
 def get_parent(b):
