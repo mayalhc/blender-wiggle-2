@@ -1,0 +1,25 @@
+schema_version = "1.0.0"
+
+# 익스텐션의 고유 아이디입니다.
+id = "blender_wiggle_2_5_0_patch"
+version = "3.1.0"
+name = "Wiggle 2 (5.0 Patched)"
+tagline = "Wiggle bones with 5.0 compatibility and multi-select support."
+maintainer = "Chamiseul" #
+type = "add-on"
+
+# 4.2 이상 익스텐션 방식을 지원하도록 설정
+blender_version_min = "4.2.0"
+
+[authors]
+name = "shteeve3d, Chamiseul"
+
+[links]
+homepage = "https://github.com/mayalhc/blender-wiggle-2" 
+repository = "https://github.com/mayalhc/blender-wiggle-2"
+"Original Project" = "https://github.com/shteeve3d/blender-wiggle-2"
+
+[permissions]
+
+[tags]
+tags = ["Animation", "Rigging", "Physics"]
