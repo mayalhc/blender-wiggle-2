@@ -1,10 +1,10 @@
 schema_version = "1.0.0"
 
 id = "wiggle_2"
-version = "2.1.0"
+version = "2.1.2"
 name = "Wiggle 2 (5.0 Patched)"
-tagline = "Wiggle bones with 5.0 compatibility and multi-select support."
-maintainer = "mayaIhc"
+tagline = "Wiggle bones with 5.0 compatibility and multi-select support"
+maintainer = "Chamiseul"
 type = "add-on"
 
 blender_version_min = "4.2.0"
@@ -19,6 +19,5 @@ homepage = "https://github.com/mayalhc/blender-wiggle-2"
 repository = "https://github.com/mayalhc/blender-wiggle-2"
 "Original Project" = "https://github.com/shteeve3d/blender-wiggle-2"
 
-[permissions]
 
 

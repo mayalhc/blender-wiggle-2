@@ -30,10 +30,37 @@ def reset_ob(ob):
         reset_bone(bpy.data.objects.get(wo.name).pose.bones.get(wb.name))
 
 def reset_bone(b):
-    b.wiggle.position = b.wiggle.position_last = (b.id_data.matrix_world @ Matrix.Translation(b.tail)).translation
-    b.wiggle.position_head = b.wiggle.position_last_head = (b.id_data.matrix_world @ b.matrix).translation
-    b.wiggle.velocity = b.wiggle.velocity_head = b.wiggle.collision_normal = b.wiggle.collision_normal_head = Vector((0,0,0))
-    b.wiggle.matrix = flatten(b.id_data.matrix_world @ b.matrix)
+    # 1. 시각적 포즈를 원래 자리로 리셋
+    b.matrix_basis = Matrix.Identity(4)
+    
+    # 2. 강제로 본의 월드 행렬을 계산 (이 과정이 빠지면 위치값이 어긋납니다)
+    b.id_data.update_tag()
+    bpy.context.view_layer.update() 
+    
+    # 3. 업데이트된 본의 실제 월드 위치 확보
+    world_mat = b.id_data.matrix_world
+    current_world_matrix = world_mat @ b.matrix
+    
+    # 4. 물리 좌표를 현재 본의 '실제 월드 좌표'로 완벽 동기화
+    # b.tail은 로컬 좌표이므로 월드 행렬을 곱해 정확한 위치를 얻어야 합니다.
+    curr_tail_pos = (world_mat @ b.matrix @ Matrix.Translation(Vector((0, b.bone.length, 0)))).translation
+    curr_head_pos = current_world_matrix.translation
+    
+    # 5. 가속도와 속도를 0으로 완전히 죽임 (날아가는 것 방지)
+    b.wiggle.position = b.wiggle.position_last = curr_tail_pos
+    b.wiggle.position_head = b.wiggle.position_last_head = curr_head_pos
+    
+    zero_v = Vector((0, 0, 0))
+    b.wiggle.velocity = b.wiggle.velocity_head = zero_v
+    b.wiggle.collision_normal = b.wiggle.collision_normal_head = zero_v
+    
+    # 6. 물리 연산용 행렬 데이터도 현재 리셋된 값으로 덮어씀
+    b.wiggle.matrix = flatten(current_world_matrix)
+    
+    # 7. 마지막으로 update_matrix를 호출하여 연산 준비 완료
+    update_matrix(b, last=True)
+
+
                       
 def build_list():
     bpy.context.scene.wiggle.list.clear()
@@ -556,59 +583,72 @@ def wiggle_pre(scene):
             b.scale = Vector((1,1,1))
     bpy.context.view_layer.update()
 
+# START OF REVISION #
 @persistent                
-def wiggle_post(scene,dg):
-    if (scene.wiggle.lastframe == scene.frame_current) and not scene.wiggle.reset: return
-    if scene.wiggle.reset: return
-    if not scene.wiggle_enable: return
+def wiggle_post(scene, dg):
+    # 1. 실행 조건 체크
     if scene.wiggle.is_rendering: return
+    if not scene.wiggle_enable: return
 
+    curr_frame = scene.frame_current
     lastframe = scene.wiggle.lastframe
-    if (scene.frame_current == scene.frame_start) and (scene.wiggle.loop == False) and (scene.wiggle.is_preroll == False):
-        bpy.ops.wiggle.reset()
-        return
-    if scene.frame_current >= lastframe:
-        frames_elapsed = scene.frame_current - lastframe
-    else:
-        e1 = (scene.frame_end - lastframe) + (scene.frame_current - scene.frame_start) + 1
-        e2 = lastframe - scene.frame_current
-        frames_elapsed = min(e1,e2)
-    if frames_elapsed > 4: frames_elapsed = 1 #handle large jumps?
-    if scene.wiggle.is_preroll: frames_elapsed = 1
-    scene.wiggle.dt = 1/scene.render.fps * frames_elapsed
-    scene.wiggle.lastframe = scene.frame_current
 
+    # 2. [핵심 수정] 시작 프레임이나 0프레임으로 돌아갔을 때 강제 리셋
+    # 타임라인을 점프해서 앞으로 갔을 때 데이터를 초기화해야 꼬이지 않습니다.
+    if curr_frame <= scene.frame_start or scene.wiggle.reset:
+        reset_scene()
+        scene.wiggle.lastframe = curr_frame
+        scene.wiggle.reset = False
+        return
+
+    # 프레임 중복 계산 방지
+    if curr_frame == lastframe: return
+
+    # 3. 프레임 경과 계산
+    if curr_frame > lastframe:
+        frames_elapsed = curr_frame - lastframe
+    else:
+        # 역재생이나 루프 시 1프레임으로 간주하여 리셋 방지
+        frames_elapsed = 1
+        
+    if frames_elapsed > 4: frames_elapsed = 1
+    if scene.wiggle.is_preroll: frames_elapsed = 1
+    
+    scene.wiggle.dt = (1.0 / max(1.0, scene.render.fps)) * frames_elapsed
+    scene.wiggle.lastframe = curr_frame
+
+    # 4. 시뮬레이션 및 데이터 업데이트
     for wo in scene.wiggle.list:
-        ob = scene.objects[wo.name]
-        if ob.wiggle_mute or ob.wiggle_freeze: continue
-        bones = []
-        for wb in wo.list:
-            b = ob.pose.bones[wb.name]
-            if b.wiggle_mute or not (b.wiggle_head or b.wiggle_tail):
-#                reset_bone(b)
-                continue
-            bones.append(ob.pose.bones[wb.name])
+        ob = scene.objects.get(wo.name)
+        if not ob or ob.wiggle_mute or ob.wiggle_freeze: continue
+        
+        bones = [ob.pose.bones[wb.name] for wb in wo.list 
+                 if wb.name in ob.pose.bones and not ob.pose.bones[wb.name].wiggle_mute]
+            
+        if not bones: continue
+
         for b in bones:
             b.wiggle.collision_normal = b.wiggle.collision_normal_head = Vector((0,0,0))
-            move(b,dg)
-        for i in range(scene.wiggle.iterations):
+            move(b, dg)
+            
+        for i in range(max(1, scene.wiggle.iterations)):
             for b in bones:
-                constrain(b, scene.wiggle.iterations-1-i,dg)
+                constrain(b, scene.wiggle.iterations - 1 - i, dg)
+        
         for b in bones:
-            update_matrix(b,True) #final update handling constraints?
-        if frames_elapsed:
-            for b in bones:
-                vb = Vector((0,0,0))
-                if b.wiggle.collision_normal.length:
-                    vb = b.wiggle.velocity.reflect(b.wiggle.collision_normal).project(b.wiggle.collision_normal)*b.wiggle_bounce
-                b.wiggle.velocity = (b.wiggle.position - b.wiggle.position_last)/max(frames_elapsed,1) + vb
-                vb = Vector((0,0,0)) 
-                if b.wiggle.collision_normal_head.length:
-                    vb = b.wiggle.velocity_head.reflect(b.wiggle.collision_normal_head).project(b.wiggle.collision_normal_head)*b.wiggle_bounce_head
-                b.wiggle.velocity_head = (b.wiggle.position_head - b.wiggle.position_last_head)/max(frames_elapsed,1) + vb
-                b.wiggle.position_last = b.wiggle.position
-                b.wiggle.position_last_head = b.wiggle.position_head
-                
+            # last=True로 설정하여 시각적 포즈 업데이트
+            update_matrix(b, True)
+            
+            if frames_elapsed:
+                # 속도 및 이전 위치 저장 (.copy() 필수)
+                b.wiggle.velocity = (b.wiggle.position - b.wiggle.position_last) / frames_elapsed
+                b.wiggle.velocity_head = (b.wiggle.position_head - b.wiggle.position_last_head) / frames_elapsed
+                b.wiggle.position_last = b.wiggle.position.copy()
+                b.wiggle.position_last_head = b.wiggle.position_head.copy()
+        
+        # 5. 캐시 기록 활성화 (타임라인 빨간 줄 생성)
+        ob.update_tag()
+
 @persistent        
 def wiggle_render_pre(scene):
     scene.wiggle.is_rendering = True
@@ -623,9 +663,11 @@ def wiggle_render_cancel(scene):
     
 @persistent
 def wiggle_load(scene):
-    build_list()
-    s = bpy.context.scene
-    s.wiggle.is_rendering = False
+    if 'build_list' in globals(): build_list()
+    scene.wiggle.is_rendering = False
+    scene.wiggle.lastframe = scene.frame_current
+# END OF REVISION #
+
             
 class WiggleCopy(bpy.types.Operator):
     """Copy active wiggle settings to selected bones"""
@@ -680,7 +722,6 @@ class WiggleCopy(bpy.types.Operator):
 
 # START OF REVISION #
 class WiggleReset(bpy.types.Operator):
-    """Reset scene wiggle physics to rest state"""
     bl_idname = "wiggle.reset"
     bl_label = "Reset Physics"
     
@@ -688,32 +729,30 @@ class WiggleReset(bpy.types.Operator):
     def poll(cls,context):
         return context.scene.wiggle_enable and context.mode in ['OBJECT', 'POSE']
     
-    def execute(self,context):
-        # 물리 연산 초기화 신호 활성화
+    def execute(self, context):
+        # 1. 물리 엔진 일시 정지 신호
         context.scene.wiggle.reset = True
-        # 현재 프레임을 강제로 다시 설정하여 연산 갱신 유도
-        context.scene.frame_set(context.scene.frame_current)
-        context.scene.wiggle.reset = False
-        rebuild = False
         
-        # 관리 리스트를 순회하며 각 본의 물리 상태(위치, 속도 등)를 정지 상태로 초기화
+        # 2. 리셋 실행 (위에서 수정한 reset_bone 호출)
         for wo in context.scene.wiggle.list:
             ob = context.scene.objects.get(wo.name)
-            if not ob:
-                rebuild = True
-                continue
-            for wb in wo.list:
-                b = ob.pose.bones.get(wb.name)
-                if not b:
-                    rebuild = True
-                    continue
-                # 앞서 수정한 reset_bone 함수를 호출하여 본의 행렬과 물리값 초기화
-                reset_bone(b)
+            if ob:
+                for wb in wo.list:
+                    b = ob.pose.bones.get(wb.name)
+                    if b: reset_bone(b)
         
-        # 마지막 연산 프레임을 현재 프레임으로 동기화
+        # 3. [핵심] 리셋된 수평 행렬값을 뷰 레이어에 즉시 반영
+        context.view_layer.update()
+        
+        # 4. 마지막 연산 프레임을 현재로 고정하여 핸들러의 추적 방지
         context.scene.wiggle.lastframe = context.scene.frame_current
+        context.scene.wiggle.reset = False
         
-        if rebuild: build_list()
+        # 5. 화면 강제 새로고침
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+        
         return {'FINISHED'}
 # END OF REVISION #
 
