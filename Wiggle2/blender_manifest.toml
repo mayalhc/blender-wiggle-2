@@ -1,23 +1,31 @@
 schema_version = "1.0.0"
 
 id = "wiggle_2"
-version = "2.1.2"
+version = "2.1.4"
 name = "Wiggle 2 (5.0 Patched)"
-tagline = "Wiggle bones with 5.0 compatibility and multi-select support"
+
+tagline = "Pro wiggle physics for bones. Optimized for GroomForge"
 maintainer = "Chamiseul"
 type = "add-on"
 
 blender_version_min = "4.2.0"
 
 license = ["SPDX:GPL-3.0-or-later"]
+
 [authors]
 name = "shteeve3d, Chamiseul"
-tags = ["Animation", "Rigging", "Physics"]
+tags = ["Animation", "Rigging", "Physics", "Hair"]
 
 [links]
-homepage = "https://github.com/mayalhc/blender-wiggle-2" 
+
+homepage = "https://github.com/mayalhc/blender-wiggle-2"
+
 repository = "https://github.com/mayalhc/blender-wiggle-2"
-"Original Project" = "https://github.com/shteeve3d/blender-wiggle-2"
+"Original Project (shteeve3d)" = "https://github.com/shteeve3d/blender-wiggle-2"
+"GroomForge Tools" = "https://superhivemarket.com/products/groomforge"
 
-
-
+description = """
+Wiggle 2 brings high-performance jiggle physics to Blender 5.0 and beyond. 
+This version features multi-select support, a standalone UI tab, and real-time visual collision guides. 
+Developed as part of the GroomForge ecosystem, it provides essential physics for hair and dynamic rig setups.
+"""
