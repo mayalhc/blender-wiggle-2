@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "wiggle_2"
-version = "2.1.4"
+version = "2.1.5"
 name = "Wiggle 2 (5.0 Patched)"
 
 tagline = "Pro wiggle physics for bones. Optimized for GroomForge"

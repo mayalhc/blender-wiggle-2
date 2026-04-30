@@ -24,14 +24,21 @@ class WIGGLE_PT_Settings(WigglePanel, bpy.types.Panel):
         row = layout.row()
         row.prop(scene, "wiggle_enable", icon='SCENE_DATA' if scene.wiggle_enable else 'HIDE_ON', text="", emboss=False)
         if not scene.wiggle_enable: row.label(text='Scene Muted.'); return
+        
         row = layout.row()
         if getattr(obj, "wiggle_freeze", False): 
             row.prop(obj, 'wiggle_freeze', icon='FREEZE', icon_only=True, emboss=False)
             row.label(text='Frozen (Baked)')
         else:
             row.prop(obj, 'wiggle_mute', icon='ARMATURE_DATA' if not obj.wiggle_mute else 'HIDE_ON', icon_only=True, invert_checkbox=True, emboss=False)
+            
             pb = context.active_pose_bone
-            if pb: row.prop(pb, 'wiggle_mute', icon='BONE_DATA' if not pb.wiggle_mute else 'HIDE_ON', icon_only=True, invert_checkbox=True, emboss=False)
+            if pb: 
+                row.prop(pb, 'wiggle_mute', icon='BONE_DATA' if not pb.wiggle_mute else 'HIDE_ON', icon_only=True, invert_checkbox=True, emboss=False)
+
+                layout.separator()
+                col = layout.column(align=True)
+                col.prop(pb, "wiggle_angle_limit", text="Angle Limit", slider=True)
 
 class WIGGLE_PT_Tail(WigglePanel, bpy.types.Panel):
     bl_label = ""
@@ -136,9 +143,11 @@ class WIGGLE_PT_Bake(WigglePanel, bpy.types.Panel):
         row = layout.row(); row.enabled = not w.bake_overwrite; row.prop(w, 'bake_nla')
         if hasattr(bpy.ops.wiggle, 'bake'): layout.operator('wiggle.bake', icon='REC')
 
+# --- 1. UI 패널 클래스 정의 (기존 패널들과 함께 위치) ---
+
 # --- REGISTRATION ---
 classes = (
-    WIGGLE_PT_Settings, 
+    WIGGLE_PT_Settings,
     WIGGLE_PT_Head, 
     WIGGLE_PT_Tail, 
     WIGGLE_PT_Utilities, 
@@ -146,26 +155,42 @@ classes = (
 )
 
 def register():
-    # 중복 정의 방지를 위해 체크 후 등록
+    # 1. 기존 가이드 셰이프 프로퍼티
     if not hasattr(bpy.types.Scene, "wiggle_guide_shape"):
         bpy.types.Scene.wiggle_guide_shape = bpy.props.EnumProperty(
             name="Shape", 
             items=[('BOX', "Box", ""), ('CYLINDER', "Cylinder", ""), ('CAPSULE', "Capsule", "")], 
             default='BOX'
         )
-    
+
+    bpy.types.PoseBone.wiggle_angle_limit = bpy.props.FloatProperty(
+        name="Angle Limit",
+        description="Alt+Enter sets the angle for all selected bones",
+        default=180.0,
+        min=0.0,
+        max=180.0,
+        step=100,
+        precision=1,
+    )
+
+    # 4. 클래스 등록
     for cls in classes:
-        # 이미 등록된 클래스인지 체크 (안전 장치)
         if not hasattr(bpy.types, cls.__name__):
             bpy.utils.register_class(cls)
 
 def unregister():
+    # 등록 역순 해제
     for cls in reversed(classes):
         if hasattr(bpy.types, cls.__name__):
             bpy.utils.unregister_class(cls)
     
+    # 프로퍼티 삭제
     if hasattr(bpy.types.Scene, "wiggle_guide_shape"):
         del bpy.types.Scene.wiggle_guide_shape
+    if hasattr(bpy.types.Scene, "wiggle_hair_radius"):
+        del bpy.types.Scene.wiggle_hair_radius
+    if hasattr(bpy.types.PoseBone, "wiggle_angle_limit"):
+        del bpy.types.PoseBone.wiggle_angle_limit
 
 if __name__ == "__main__":
     register()

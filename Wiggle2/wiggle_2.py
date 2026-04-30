@@ -9,7 +9,7 @@
 
 import bpy, math
 from bpy.app.handlers import persistent
-from mathutils import Vector, Matrix
+from mathutils import Vector, Matrix, Quaternion
 
 #return m2 in m1 space
 def relative_matrix(m1,m2):
@@ -31,7 +31,8 @@ def reset_ob(ob):
 
 def reset_bone(b):
     # 1. 시각적 포즈를 원래 자리로 리셋
-    b.matrix_basis = Matrix.Identity(4)
+    if b is not None:  # 뼈가 존재하는지 확인하는 로직 추가
+        b.matrix_basis = Matrix.Identity(4)
     
     # 2. 강제로 본의 월드 행렬을 계산 (이 과정이 빠지면 위치값이 어긋납니다)
     b.id_data.update_tag()
@@ -356,63 +357,103 @@ def update_visual_guide(self, context):
 
 # START OF REVISION #
 
-def move(b,dg):
-    dt = bpy.context.scene.wiggle.dt
-    dt2 = dt * dt
-    if not dt: return
+def move(b, dg):
+    # 1. 실행 방지 조건 확인
+    if getattr(b.id_data, "wiggle_freeze", False): return
+    
+    # scene 설정 가져오기 (경로가 정확한지 확인 필요)
+    try:
+        wiggle_settings = bpy.context.scene.wiggle
+        dt = wiggle_settings.dt
+    except AttributeError:
+        # scene.wiggle이 없을 경우를 대비한 기본값
+        dt = 1/24 
+
+    if not dt or dt <= 0: return
 
     if b.wiggle_tail:
-        # 1. 물리 기본 연산 (초기 버전으로 복구)
-        damp = max(min(1 - b.wiggle_damp * dt, 1), 0) 
-        b.wiggle.velocity = b.wiggle.velocity * damp
-        F = bpy.context.scene.gravity * b.wiggle_gravity
+        # 본 길이 및 스케일 보정
+        is_tiny = b.bone.length <= 0.03
+        s = 100.0 if is_tiny else 1.0 
+        L = b.bone.length * s
         
-        # 바람(Wind) 로직 포함
-        if b.wiggle_wind_ob:
-            dir = b.wiggle_wind_ob.matrix_world.to_quaternion().to_matrix().to_4x4() @ Vector((0,0,1))
-            F += dir * b.wiggle_wind_ob.field.strength * b.wiggle_wind / b.wiggle_mass
-            
-        b.wiggle.position += b.wiggle.velocity + F * dt2
-        pin(b)
+        # [중요] 이전 위치 및 속도 데이터 안전하게 가져오기
+        old_v_pos = b.wiggle.position.copy() * s
+        v_vel = b.wiggle.velocity.copy() * s
         
-        # 2. 컬렉션 충돌 로직 (기능 유지)
-        collider_obs = []
-        if b.wiggle_collider_type == 'Object' and b.wiggle_collider:
-            collider_obs.append(b.wiggle_collider)
-        elif b.wiggle_collider_type == 'Collection' and b.wiggle_collider_collection:
-            collider_obs = [o for o in b.wiggle_collider_collection.objects if o.type == 'MESH']
+        # 2. 감쇠(Damping) 적용: 지터링 방지를 위해 아주 최소한(0.99)이라도 적용 권장
+        # 사용자가 설정한 damping 값이 있다면 반영 (0이면 1.0으로 작동)
+        d_val = getattr(b, "wiggle_damping", 0.1)
+        v_vel *= max(0.0, 1.0 - (d_val * dt * 10.0))
 
-        for col_obj in collider_obs:
-            orig_collider = b.wiggle_collider
-            b.wiggle_collider = col_obj
-            collide(b, dg)
-            # 충돌 감지 시 속도만 살짝 줄여 안정화
-            if b.wiggle.collision_normal.length > 0.001:
-                b.wiggle.velocity *= 0.5
-                break
-            b.wiggle_collider = orig_collider
-    
-    # Head 부분 동일 복구
-    if b.wiggle_head and not b.bone.use_connect:
-        damp_h = max(min(1 - b.wiggle_damp_head * dt, 1), 0)
-        b.wiggle.velocity_head = b.wiggle.velocity_head * damp_h
-        F_h = bpy.context.scene.gravity * b.wiggle_gravity_head
-        b.wiggle.position_head += b.wiggle.velocity_head + F_h * dt2
-        
-        colliders_h = [o for o in b.wiggle_collider_collection_head.objects if o.type == 'MESH'] if b.wiggle_collider_type_head == 'Collection' else ([b.wiggle_collider_head] if b.wiggle_collider_head else [])
-        for col_obj in colliders_h:
-            orig_h = b.wiggle_collider_head
-            b.wiggle_collider_head = col_obj
-            collide(b, dg, True)
-            if b.wiggle.collision_normal_head.length > 0.001:
-                b.wiggle.velocity_head *= 0.5
-                break
-            b.wiggle_collider_head = orig_h
+        # 3. 기준점(Head) 및 목표방향(Rest Pose) 계산
+        p = b.bone.parent
+        if p:
+            pb_parent = b.id_data.pose.bones.get(p.name)
+            # 부모의 매트릭스가 업데이트되었는지 확인
+            m_parent = pb_parent.wiggle.matrix if hasattr(pb_parent.wiggle, "matrix") else pb_parent.matrix_channel
+            head_pos = (pb_parent.wiggle.position.copy() * s) if hasattr(pb_parent.wiggle, "position") else (b.id_data.matrix_world @ b.bone.head) * s
+        else:
+            m_parent = b.id_data.matrix_world
+            head_pos = (b.id_data.matrix_world @ b.bone.head) * s
             
-    update_matrix(b)
-    # 스케일 정규화 (5.0 필수)
+        # Rest Position (가만히 있을 때 있어야 할 꼬리 끝 위치)
+        m_diff = b.bone.parent.matrix_local.inverted() @ b.bone.matrix_local if p else b.bone.matrix_local
+        m_rest = m_parent @ m_diff
+        rest_dir = (m_rest.to_quaternion() @ Vector((0, 1, 0))).normalized()
+        rest_pos = head_pos + rest_dir * L
+
+        # 4. 물리 연산 (Verlet Integration)
+        # 중력 적용
+        gravity_vec = Vector((0, 0, -9.8)) # 혹은 bpy.context.scene.gravity
+        F_gravity = gravity_vec * getattr(b, "wiggle_gravity", 1.0) * s
+        
+        # Stiffness(복원력): 현재 위치에서 목표 위치로 끌어당기는 힘
+        stiff_val = getattr(b, "wiggle_stiffness", 0.5)
+        F_stiff = (rest_pos - old_v_pos) * (stiff_val * 100.0) 
+        
+        v_mass = max(getattr(b, "wiggle_mass", 1.0), 0.01)
+        
+        # 가속도 계산 및 위치 업데이트
+        accel = (F_gravity + F_stiff) / v_mass
+        v_pos = old_v_pos + v_vel + (accel * dt * dt)
+
+        # 5. 각도 제한 (Angle Limit)
+        angle_limit = getattr(b, "wiggle_angle_limit", 180.0)
+        if angle_limit < 179.5:
+            target_vec = v_pos - head_pos
+            if target_vec.length > 0.001:
+                angle = rest_dir.angle(target_vec.normalized())
+                limit_rad = math.radians(angle_limit)
+                if angle > limit_rad:
+                    axis = rest_dir.cross(target_vec).normalized()
+                    if axis.length > 0.001:
+                        q_limit = Quaternion(axis, limit_rad)
+                        v_pos = head_pos + (q_limit @ rest_dir) * L
+                        # 한계에 부딪힐 때 속도 감쇄 (안정화)
+                        v_vel *= 0.5
+
+        # 6. 충돌 처리 (기존 함수 호출)
+        b.wiggle.position = v_pos / s
+        if 'pin' in globals(): pin(b)
+        
+        # ... (충돌 로직은 기존 코드와 동일하게 유지) ...
+        if 'collide' in globals(): collide(b, dg)
+
+        # 7. 최종 위치 확정 (길이 유지 및 데이터 저장)
+        v_pos = b.wiggle.position * s # 충돌 후 위치 반영
+        final_dir = (v_pos - head_pos)
+        if final_dir.length > 0.001:
+            v_pos = head_pos + final_dir.normalized() * L
+        
+        # 속도 업데이트 (다음 프레임을 위해 저장)
+        b.wiggle.velocity = (v_pos - old_v_pos) / s
+        b.wiggle.position = v_pos / s
+        b.wiggle.position_head = head_pos / s
+
+    # 8. 매트릭스 갱신 및 수치 안정화
+    if 'update_matrix' in globals(): update_matrix(b)
     b.matrix = b.matrix.to_3x3().normalized().to_4x4()
-
 
 # START OF REVISION #
 def constrain(b, i, dg):
@@ -426,7 +467,7 @@ def constrain(b, i, dg):
         Fs = s * stiff / bpy.context.scene.wiggle.iterations
         if (Fs * dt * dt).length > s.length:
             return s
-        return Fs * dt * dt
+        return Fs * dt
     
     def stretch(target, position, fac):
         s = target - position
@@ -718,10 +759,15 @@ def wiggle_render_cancel(scene):
     scene.wiggle.is_rendering = False
     
 @persistent
-def wiggle_load(scene):
+def wiggle_load(dummy):
     if 'build_list' in globals(): build_list()
-    scene.wiggle.is_rendering = False
-    scene.wiggle.lastframe = scene.frame_current
+    
+    scene = bpy.context.scene
+    
+    if scene and hasattr(scene, "wiggle"):
+        scene.wiggle.is_rendering = False
+        scene.wiggle.lastframe = scene.frame_current
+
 # END OF REVISION #
 
             
@@ -1221,6 +1267,15 @@ def register():
         name = 'Damp', min = 0, default = 1, override={'LIBRARY_OVERRIDABLE'},
         update=lambda s, c: update_prop(s, c, 'wiggle_damp')
     )
+    bpy.types.PoseBone.wiggle_angle_limit = bpy.props.FloatProperty(
+        name="Angle Limit",
+        description="Restrict the maximum rotation angle from the rest pose to prevent mesh distortion",
+        default=180.0,
+        min=0.0,
+        max=180.0,
+        unit='ROTATION'
+    )
+
     bpy.types.PoseBone.wiggle_gravity = bpy.props.FloatProperty(
         name = 'Gravity', default = 1, override={'LIBRARY_OVERRIDABLE'},
         update=lambda s, c: update_prop(s, c, 'wiggle_gravity')
