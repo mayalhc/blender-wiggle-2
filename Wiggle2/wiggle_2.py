@@ -1376,7 +1376,7 @@ def register():
         update=lambda s, c: update_prop(s, c, 'wiggle_mass')
     )
     bpy.types.PoseBone.wiggle_stiff = bpy.props.FloatProperty(
-        name = 'Stiff', min = 0, default = 200, override={'LIBRARY_OVERRIDABLE'},
+        name = 'Stiff', min = 0, default = 20, override={'LIBRARY_OVERRIDABLE'},
         update=lambda s, c: update_prop(s, c, 'wiggle_stiff')
     )
     bpy.types.PoseBone.wiggle_stretch = bpy.props.FloatProperty(
@@ -1417,7 +1417,7 @@ def register():
         update=lambda s, c: update_prop(s, c, 'wiggle_mass_head')
     )
     bpy.types.PoseBone.wiggle_stiff_head = bpy.props.FloatProperty(
-        name = 'Stiff', min = 0, default = 400, override={'LIBRARY_OVERRIDABLE'},
+        name = 'Stiff', min = 0, default = 50, override={'LIBRARY_OVERRIDABLE'},
         update=lambda s, c: update_prop(s, c, 'wiggle_stiff_head')
     )
     bpy.types.PoseBone.wiggle_stretch_head = bpy.props.FloatProperty(
