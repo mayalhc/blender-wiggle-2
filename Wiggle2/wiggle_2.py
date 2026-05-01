@@ -25,9 +25,22 @@ def reset_scene():
         reset_ob(bpy.data.objects.get(wo.name))
                               
 def reset_ob(ob):
+    # 1. 해당 오브젝트의 위글 데이터를 가져옴
     wo = bpy.context.scene.wiggle.list.get(ob.name)
-    for wb in wo.list:
-        reset_bone(bpy.data.objects.get(wo.name).pose.bones.get(wb.name))
+    
+    # 2. 데이터가 존재하는지(None이 아닌지) 먼저 확인
+    if wo and hasattr(wo, 'list'):
+        for wb in wo.list:
+            # 해당 오브젝트와 본이 존재하는지 확인하며 리셋
+            arm_obj = bpy.data.objects.get(wo.name)
+            if arm_obj and arm_obj.pose:
+                pb = arm_obj.pose.bones.get(wb.name)
+                if pb:
+                    reset_bone(pb)
+    else:
+        # 데이터가 없으면 에러 없이 조용히 넘어감
+        pass
+
 
 def reset_bone(b):
     # 1. 시각적 포즈를 원래 자리로 리셋
@@ -357,87 +370,158 @@ def update_visual_guide(self, context):
 
 # START OF REVISION #
 
+def apply_angle_limits(b, h_pos, q_basis, rest_dir, world_rest_length):
+    from math import atan2, cos, sin, radians, acos
+    curr_vec = b.wiggle.position - h_pos
+    if curr_vec.length < 1e-6: 
+        return h_pos + rest_dir * world_rest_length
+
+    # 1. 개별 리미트 (X: 상하, Z: 좌우)
+    if getattr(b, "wiggle_use_individual_limits", False):
+        local_dir = q_basis.inverted() @ curr_vec
+        ang_z = atan2(local_dir.x, local_dir.y) 
+        ang_x = -atan2(local_dir.z, local_dir.y)
+        lim_x, lim_z = radians(b.wiggle_limit_x), radians(b.wiggle_limit_z)
+        
+        ang_x_c = max(min(ang_x, lim_x), -lim_x)
+        ang_z_c = max(min(ang_z, lim_z), -lim_z)
+        
+        new_l = Vector((
+            sin(ang_z_c) * cos(ang_x_c),
+            cos(ang_z_c) * cos(ang_x_c),
+            -sin(ang_x_c)
+        ))
+        curr_vec = q_basis @ new_l * world_rest_length
+
+    # 2. 통합 리미트 (Total Limit) — 상하좌우 30도 원뿔 제한
+    if getattr(b, "wiggle_angle_limit", 180) < 179.5:
+        limit_rad = radians(b.wiggle_angle_limit)
+        curr_dir = curr_vec.normalized()
+        dot = max(-1.0, min(1.0, rest_dir.dot(curr_dir)))
+        
+        if acos(dot) > limit_rad:
+            axis = rest_dir.cross(curr_dir)
+            if axis.length > 1e-6:
+                curr_vec = (Quaternion(axis, limit_rad) @ rest_dir) * world_rest_length
+
+    return h_pos + curr_vec.normalized() * world_rest_length
+
+
 def move(b, dg):
-    if getattr(b.id_data, "wiggle_freeze", False): return
     dt = bpy.context.scene.wiggle.dt
-    if not dt or dt <= 0: return
+    if not dt:
+        # dt == 0 (정지 상태) → 리미트/헤드 위치 즉시 반영 (헤드 설정 실시간 UI 반영)
+        if b.wiggle_tail or b.wiggle_head:
+            m_world = b.id_data.matrix_world
+            p = b.bone.parent
+            if p:
+                pb_p = b.id_data.pose.bones.get(p.name)
+                m_rest = m_world @ pb_p.matrix @ (p.matrix_local.inverted() @ b.bone.matrix_local)
+            else:
+                m_rest = m_world @ b.bone.matrix_local
+                
+            q_basis = m_rest.to_quaternion()
+            local_rest_vec = Vector((0, b.bone.length, 0))
+            world_rest_vec = m_rest.to_3x3() @ local_rest_vec
+            world_rest_length = world_rest_vec.length
+            rest_dir = world_rest_vec.normalized() if world_rest_length > 1e-8 else Vector((0, 1, 0))
+            
+            # ★★★ 헤드 설정이 제대로 반영되도록 수정 ★★★
+            h_pos_anim = m_world @ b.head                     # ← b.bone.head → b.head (pose 위치)
+            h_pos = b.wiggle.position_head if (b.wiggle_head and not b.bone.use_connect) else h_pos_anim
+            
+            if b.wiggle_tail:
+                b.wiggle.position = apply_angle_limits(b, h_pos, q_basis, rest_dir, world_rest_length)
+            if b.wiggle_head and not b.bone.use_connect:
+                b.wiggle.position_head = h_pos_anim   # 헤드도 리미트 적용 후 동기화
+            
+            update_matrix(b)
+        return
+
     dt2 = dt * dt
 
-    if b.wiggle_tail:
-        # 1. 부모의 최신 물리 위치를 '절대 기준'으로 가져오기
-        p = b.bone.parent
-        if p:
-            pb_parent = b.id_data.pose.bones.get(p.name)
-            # 부모 본의 시뮬레이션 끝점(Tail) 좌표를 내 시작점(Head)으로 강제 고정
-            head_pos = pb_parent.wiggle.position.copy()
-            m_parent = pb_parent.wiggle.matrix
-        else:
-            # 루트 본인 경우 아머처 월드 기준 헤드 위치
-            head_pos = b.id_data.matrix_world @ b.bone.head
-            m_parent = b.id_data.matrix_world
-
-        # 2. 물리 연산 시작 (이전 위치 저장)
-        old_pos = b.wiggle.position.copy()
-        damp = max(min(1 - b.wiggle_damp * dt, 1), 0)
+    # 기준 좌표계 (모든 경우 공통)
+    m_world = b.id_data.matrix_world
+    p = b.bone.parent
+    if p:
+        pb_p = b.id_data.pose.bones.get(p.name)
+        m_rest = m_world @ pb_p.matrix @ (p.matrix_local.inverted() @ b.bone.matrix_local)
+    else:
+        m_rest = m_world @ b.bone.matrix_local
         
-        # 속도 감쇄 (지그재그를 잡기 위해 에너지를 미리 조금 깎음)
+    q_basis = m_rest.to_quaternion()
+    world_rest_vec = m_rest.to_3x3() @ Vector((0, b.bone.length, 0))
+    world_rest_length = world_rest_vec.length
+    rest_dir = world_rest_vec.normalized() if world_rest_length > 1e-8 else Vector((0, 1, 0))
+    
+    # ★★★ 헤드 설정 핵심 수정: 항상 현재 pose된 head 위치 사용 ★★★
+    h_pos_anim = m_world @ b.head          # ← b.bone.head → b.head (이게 헤드 설정이 안 되던 주범)
+
+    # 1. TAIL 물리
+    if b.wiggle_tail:
+        old_pos = b.wiggle.position.copy()
+        
+        # 감쇄
+        damp = max(min(1 - b.wiggle_damp * dt, 1), 0)
         b.wiggle.velocity *= damp
         
+        # 중력 + 바람
         F = bpy.context.scene.gravity * b.wiggle_gravity
-        # 위치 이동
-        b.wiggle.position += b.wiggle.velocity + F * dt2
+        if b.wiggle_wind_ob:
+            w_dir = (b.wiggle_wind_ob.matrix_world.to_quaternion() @ Vector((0,0,1))).normalized()
+            fac = 1 - b.wiggle_wind_ob.field.wind_factor * abs(w_dir.dot((b.wiggle.position - b.wiggle.matrix.translation).normalized()))
+            F += w_dir * fac * b.wiggle_wind_ob.field.strength * b.wiggle_wind / b.wiggle_mass
 
-        # 3. 0도 기준점 및 각도 제한 (로컬 축 기준)
-        # ★★★ 수정된 부분 ★★★
-        # - 부모 본을 중심으로 한 '꼬깔(콘) 모양' 회전 제한
-        # - rest_dir을 "부모 본의 현재 시뮬레이션 방향"으로 변경
-        #   → 0도 입력 시 완전 일직선
-        #   → 90도 입력 시 정확히 직각(perpendicular)
-        # - 부모/자식 본으로 limit이 전달되지 않음 (독립 적용 유지)
-        try:
-            if p:
-                # 부모 본의 현재 방향을 콘의 중심 축으로 사용 (부모 중심 꼬깔)
-                parent_dir = (m_parent.to_quaternion() @ Vector((0, 1, 0))).normalized()
-                rest_dir = parent_dir
-            else:
-                # 루트 본은 기존처럼 자신의 rest pose 방향 사용
-                m_rest = b.id_data.matrix_world @ b.bone.matrix_local
-                rest_dir = (m_rest.to_quaternion() @ Vector((0, 1, 0))).normalized()
-            
-            target_vec = b.wiggle.position - head_pos
-            dist = target_vec.length
-            
-            if dist > 0.001:
-                target_dir = target_vec.normalized()
-                limit_rad = math.radians(b.wiggle_angle_limit)
-                
-                # 앵글 제한 로직
-                if b.wiggle_angle_limit < 179.5:
-                    angle = rest_dir.angle(target_dir)
-                    if angle > limit_rad:
-                        if limit_rad < 0.01:
-                            # 0도일 때: 부모 방향과 완전 일직선 강제
-                            b.wiggle.position = head_pos + rest_dir * dist
-                        else:
-                            q_limit = rest_dir.rotation_difference(target_dir)
-                            if q_limit.angle > 0.001:
-                                q_clamp = Quaternion(q_limit.axis, limit_rad)
-                                b.wiggle.position = head_pos + (q_clamp @ rest_dir) * dist
-                
-                # 4. 본 길이 강제 유지 (Stretching에 의한 에너지 증폭 차단)
-                b.wiggle.position = head_pos + (b.wiggle.position - head_pos).normalized() * b.bone.length
-        except: pass
-
-        # 5. 속도 재동기화 (가짜 에너지 삭제)
-        # 보정된 최종 위치와 이전 위치의 차이만 속도로 인정
-        b.wiggle.velocity = (b.wiggle.position - old_pos) * damp
+        # Stiffness (헤드 본인 경우 자신의 position_head를 기준으로)
+        h_pos = b.wiggle.position_head if (b.wiggle_head and not b.bone.use_connect) else h_pos_anim
+        target_pos = h_pos + rest_dir * world_rest_length
+        dist_vec = target_pos - b.wiggle.position
         
-        # 6. 데이터 승인
-        b.wiggle.position_head = head_pos
-        pin(b) 
+        stiff_clamped = min(b.wiggle_stiff, 1.0 / dt2 * 0.1) 
+        F += dist_vec * stiff_clamped
+
+        # 위치 업데이트
+        b.wiggle.position += b.wiggle.velocity + F * dt2
+        
+        # 리미트 적용
+        b.wiggle.position = apply_angle_limits(b, h_pos, q_basis, rest_dir, world_rest_length)
+        
+        pin(b)
+        collide(b, dg)
+        
+        # 속도 재동기화 (부드러운 blending)
+        calculated_vel = (b.wiggle.position - old_pos)
+        b.wiggle.velocity = b.wiggle.velocity * 0.2 + calculated_vel * 0.8
+
+    # 2. HEAD 물리 (완전 독립적으로 동작하도록 보강)
+    if b.wiggle_head and not b.bone.use_connect:
+        old_h_pos = b.wiggle.position_head.copy()
+        
+        # Head 감쇄
+        damp_h = max(min(1 - b.wiggle_damp_head * dt, 1), 0)
+        b.wiggle.velocity_head *= damp_h
+        
+        # Head 가속도 (중력 + Stiffness)
+        F_h = bpy.context.scene.gravity * b.wiggle_gravity_head
+        stiff_h_clamped = min(b.wiggle_stiff_head, 1.0 / dt2 * 0.1)
+        F_h += (h_pos_anim - b.wiggle.position_head) * stiff_h_clamped   # h_pos_anim 사용
+        
+        # 위치 업데이트
+        b.wiggle.position_head += b.wiggle.velocity_head + F_h * dt2
+        
+        collide(b, dg, True)
+        
+        # Head 속도 업데이트 (blending)
+        b.wiggle.velocity_head = b.wiggle.velocity_head * 0.2 + (b.wiggle.position_head - old_h_pos) * 0.8
+    else:
+        # Head 물리가 아닌 본 → 애니메이션 위치로 강제 동기화
+        b.wiggle.position_head = h_pos_anim
             
     update_matrix(b)
-    b.matrix = b.matrix.to_3x3().normalized().to_4x4()
+
+
+
+
 
 # START OF REVISION #
 def constrain(b, i, dg):
@@ -655,7 +739,11 @@ def wiggle_post(scene, dg):
         
         scene.wiggle.lastframe = curr_frame
         scene.wiggle.reset = False
-        bpy.ops.wiggle.reset()
+        if hasattr(scene, "wiggle") and scene.wiggle:
+            try:
+                bpy.ops.wiggle.reset()
+            except Exception as e:
+                print(f"Wiggle reset skipped: {e}")
         return
 
     if curr_frame >= lastframe:
@@ -1020,18 +1108,17 @@ class WigglePreset(bpy.types.Operator):
         context.scene["wiggle_updating"] = True
         try:
             if self.type == 'JELLY': 
-                b.wiggle_stiff, b.wiggle_damp, b.wiggle_bounce, b.wiggle_gravity, b.wiggle_friction = 30.0, 0.15, 0.8, 0.5, 0.4
+                b.wiggle_stiff, b.wiggle_damp, b.wiggle_bounce, b.wiggle_gravity, b.wiggle_friction = 15.0, 0.1, 0.8, 0.5, 0.4
             elif self.type == 'HAIR': 
-                b.wiggle_stiff, b.wiggle_damp, b.wiggle_friction, b.wiggle_gravity, b.wiggle_bounce = 120.0, 0.6, 0.8, 1.0, 0.1
+                b.wiggle_stiff, b.wiggle_damp, b.wiggle_friction, b.wiggle_gravity, b.wiggle_bounce = 35.0, 0.5, 0.8, 1.0, 0.1
             elif self.type == 'HEAVY': 
-                b.wiggle_stiff, b.wiggle_damp, b.wiggle_gravity, b.wiggle_friction = 60.0, 0.5, 2.5, 0.9
+                b.wiggle_stiff, b.wiggle_damp, b.wiggle_gravity, b.wiggle_friction = 25.0, 0.4, 2.5, 0.9
             elif self.type == 'CLOTH': 
-                b.wiggle_stiff, b.wiggle_damp, b.wiggle_gravity, b.wiggle_friction = 10.0, 0.8, 0.8, 0.7
+                b.wiggle_stiff, b.wiggle_damp, b.wiggle_gravity, b.wiggle_friction = 5.0, 0.8, 0.8, 0.7
             elif self.type == 'SPRING': 
-                b.wiggle_stiff, b.wiggle_damp, b.wiggle_bounce, b.wiggle_gravity = 200.0, 0.08, 1.0, 0.2
+                b.wiggle_stiff, b.wiggle_damp, b.wiggle_bounce, b.wiggle_gravity = 45.0, 0.1, 0.9, 0.3
             elif self.type == 'ANTENNA': 
-                b.wiggle_stiff, b.wiggle_damp, b.wiggle_bounce, b.wiggle_gravity = 150.0, 0.05, 0.5, 0.1
-            
+                b.wiggle_stiff, b.wiggle_damp, b.wiggle_bounce, b.wiggle_gravity = 40.0, 0.15, 0.5, 0.1            
             bpy.ops.wiggle.reset() 
         finally:
             context.scene["wiggle_updating"] = False
@@ -1395,6 +1482,10 @@ def register():
     if wiggle_render_cancel not in h_r_can: h_r_can.append(wiggle_render_cancel)
     h_load = bpy.app.handlers.load_post
     if wiggle_load not in h_load: h_load.append(wiggle_load)
+    bpy.types.PoseBone.wiggle_use_angle_limit = bpy.props.BoolProperty(
+        name="Use Angle Limit",
+        default=False
+    )
 
 def unregister():
     classes = (

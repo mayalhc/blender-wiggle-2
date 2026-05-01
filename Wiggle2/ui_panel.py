@@ -3,6 +3,9 @@ import bpy
 from mathutils import Vector, Matrix
 from .wiggle_2 import WiggleReset, WiggleToggleBBox, WigglePreset
 
+# --- PROPERTIES (이 부분은 보통 __init__.py나 register 함수 근처에 있지만, 참조를 위해 표기합니다) ---
+# bpy.types.PoseBone.wiggle_use_angle_limit = bpy.props.BoolProperty(name="Use Angle Limit", default=False)
+
 # --- UTILS ---
 def flatten(mat):
     dim = len(mat)
@@ -21,24 +24,48 @@ class WIGGLE_PT_Settings(WigglePanel, bpy.types.Panel):
     bl_idname = "WIGGLE_PT_Settings"
     def draw(self, context):
         layout, scene, obj = self.layout, context.scene, context.object
+        
+        # 1. 씬 전체 위글 활성화 여부 체크
         row = layout.row()
         row.prop(scene, "wiggle_enable", icon='SCENE_DATA' if scene.wiggle_enable else 'HIDE_ON', text="", emboss=False)
-        if not scene.wiggle_enable: row.label(text='Scene Muted.'); return
+        if not scene.wiggle_enable: 
+            row.label(text='Scene Muted.')
+            return
         
+        # 2. ★ 아마추어(오브젝트) 선택 옵션 메뉴 (복구된 부분) ★
         row = layout.row()
         if getattr(obj, "wiggle_freeze", False): 
             row.prop(obj, 'wiggle_freeze', icon='FREEZE', icon_only=True, emboss=False)
             row.label(text='Frozen (Baked)')
         else:
-            row.prop(obj, 'wiggle_mute', icon='ARMATURE_DATA' if not obj.wiggle_mute else 'HIDE_ON', icon_only=True, invert_checkbox=True, emboss=False)
-            
+            # 아마추어 전체 뮤트 버튼
+            row.prop(obj, 'wiggle_mute', icon='ARMATURE_DATA' if not obj.wiggle_mute else 'HIDE_ON', 
+                     icon_only=True, invert_checkbox=True, emboss=False)
+            row.label(text=f"Object: {obj.name}") # 현재 선택된 아마추어 이름 표시
+
             pb = context.active_pose_bone
             if pb: 
-                row.prop(pb, 'wiggle_mute', icon='BONE_DATA' if not pb.wiggle_mute else 'HIDE_ON', icon_only=True, invert_checkbox=True, emboss=False)
+                # 3. 개별 본 뮤트 버튼
+                row.prop(pb, 'wiggle_mute', icon='BONE_DATA' if not pb.wiggle_mute else 'HIDE_ON', 
+                         icon_only=True, invert_checkbox=True, emboss=False)
 
+                # 4. 리미트 설정 섹션 (사용자님이 주신 로직)
                 layout.separator()
-                col = layout.column(align=True)
-                col.prop(pb, "wiggle_angle_limit", text="Angle Limit", slider=True)
+                main_col = layout.column(align=True)
+                
+                # 개별 리미트 토글
+                icon = 'CHECKBOX_HLT' if pb.wiggle_use_individual_limits else 'CHECKBOX_DEHLT'
+                main_col.prop(pb, "wiggle_use_individual_limits", text="Use Individual Limits", toggle=True, icon=icon)
+                
+                # 하단 슬라이더 박스
+                inner_box = main_col.box()
+                if pb.wiggle_use_individual_limits:
+                    col = inner_box.column(align=True)
+                    col.prop(pb, "wiggle_limit_x", text="X (up and down)")
+                    col.prop(pb, "wiggle_limit_z", text="Z (right and left)")
+                else:
+                    inner_box.prop(pb, "wiggle_angle_limit", text="Total Limit")
+
 
 class WIGGLE_PT_Tail(WigglePanel, bpy.types.Panel):
     bl_label = ""
@@ -67,7 +94,7 @@ class WIGGLE_PT_Tail(WigglePanel, bpy.types.Panel):
             icon_map = {'Box': 'MESH_CUBE', 'Cylinder': 'MESH_CYLINDER', 'Capsule': 'MESH_CAPSULE'}
             row.label(text=f"Preview Mode: {b.wiggle_collider_type}", icon=icon_map.get(b.wiggle_collider_type, 'NONE'))
             
-        for p in ['wiggle_radius', 'wiggle_friction', 'wiggle_bounce', 'wiggle_sticky', 'wiggle_limit_angle', 'wiggle_chain']:
+        for p in ['wiggle_radius', 'wiggle_friction', 'wiggle_bounce', 'wiggle_sticky', 'wiggle_chain']:
             if hasattr(b, p): layout.prop(b, p)
 
 class WIGGLE_PT_Head(WigglePanel, bpy.types.Panel):
@@ -143,6 +170,7 @@ class WIGGLE_PT_Bake(WigglePanel, bpy.types.Panel):
         row = layout.row(); row.enabled = not w.bake_overwrite; row.prop(w, 'bake_nla')
         if hasattr(bpy.ops.wiggle, 'bake'): layout.operator('wiggle.bake', icon='REC')
 
+
 # --- 1. UI 패널 클래스 정의 (기존 패널들과 함께 위치) ---
 
 # --- REGISTRATION ---
@@ -163,14 +191,39 @@ def register():
             default='BOX'
         )
 
+    # 2. 기존 앵글 리미트 속성 (통합 리미트용)
     bpy.types.PoseBone.wiggle_angle_limit = bpy.props.FloatProperty(
         name="Angle Limit",
-        description="Alt+Enter sets the angle for all selected bones",
+        description="Sets a unified rotation limit for all directions",
         default=180.0,
         min=0.0,
         max=180.0,
-        step=100,
         precision=1,
+    )
+
+    # 3. 추가된 개별 리미트 속성들
+    # 리미트 사용 여부 체크박스
+    bpy.types.PoseBone.wiggle_use_individual_limits = bpy.props.BoolProperty(
+        name="Use Individual Limits",
+        description="Activates individual limits for Up-Down and Left-Right rotation",
+        default=False
+    )
+
+    # 상하(X) 리미트
+        # 상하(X) 리미트
+    bpy.types.PoseBone.wiggle_limit_x = bpy.props.FloatProperty(
+        name="X Limit (Up-Down)",
+        description="Limits the range of rotation along the X-axis (Up-Down)",
+        min=0.0, max=180.0, default=90.0,
+        precision=1
+    )
+
+    # 좌우(Z) 리미트
+    bpy.types.PoseBone.wiggle_limit_z = bpy.props.FloatProperty(
+        name="Z Limit (Left-Right)",
+        description="Limits the range of rotation along the Z-axis (Left-Right)",
+        min=0.0, max=180.0, default=90.0,
+        precision=1
     )
 
     # 4. 클래스 등록
@@ -191,6 +244,14 @@ def unregister():
         del bpy.types.Scene.wiggle_hair_radius
     if hasattr(bpy.types.PoseBone, "wiggle_angle_limit"):
         del bpy.types.PoseBone.wiggle_angle_limit
+        
+    # 추가된 프로퍼티 삭제
+    if hasattr(bpy.types.PoseBone, "wiggle_use_individual_limits"):
+        del bpy.types.PoseBone.wiggle_use_individual_limits
+    if hasattr(bpy.types.PoseBone, "wiggle_limit_x"):
+        del bpy.types.PoseBone.wiggle_limit_x
+    if hasattr(bpy.types.PoseBone, "wiggle_limit_z"):
+        del bpy.types.PoseBone.wiggle_limit_z
 
 if __name__ == "__main__":
     register()
