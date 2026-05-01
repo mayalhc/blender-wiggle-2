@@ -1101,29 +1101,71 @@ class WigglePreset(bpy.types.Operator):
     type: bpy.props.StringProperty() 
 
     def execute(self, context):
-        arm = context.object
         b = context.active_pose_bone
+        scene = context.scene
         if not b: return {'CANCELLED'}
         
-        context.scene["wiggle_updating"] = True
+        # 1. 분배 로직 모듈 동적 로드 (익스텐션 경로 문제 해결)
         try:
-            if self.type == 'JELLY': 
-                b.wiggle_stiff, b.wiggle_damp, b.wiggle_bounce, b.wiggle_gravity, b.wiggle_friction = 15.0, 0.1, 0.8, 0.5, 0.4
-            elif self.type == 'HAIR': 
-                b.wiggle_stiff, b.wiggle_damp, b.wiggle_friction, b.wiggle_gravity, b.wiggle_bounce = 35.0, 0.5, 0.8, 1.0, 0.1
-            elif self.type == 'HEAVY': 
-                b.wiggle_stiff, b.wiggle_damp, b.wiggle_gravity, b.wiggle_friction = 25.0, 0.4, 2.5, 0.9
-            elif self.type == 'CLOTH': 
-                b.wiggle_stiff, b.wiggle_damp, b.wiggle_gravity, b.wiggle_friction = 5.0, 0.8, 0.8, 0.7
-            elif self.type == 'SPRING': 
-                b.wiggle_stiff, b.wiggle_damp, b.wiggle_bounce, b.wiggle_gravity = 45.0, 0.1, 0.9, 0.3
-            elif self.type == 'ANTENNA': 
-                b.wiggle_stiff, b.wiggle_damp, b.wiggle_bounce, b.wiggle_gravity = 40.0, 0.15, 0.5, 0.1            
-            bpy.ops.wiggle.reset() 
-        finally:
-            context.scene["wiggle_updating"] = False
-            
+            import importlib
+            package_name = '.'.join(__name__.split('.')[:-1])
+            logic_module = importlib.import_module(".physics_logic", package=package_name)
+            apply_func = getattr(logic_module, 'apply_taper_to_chain', None)
+        except Exception as e:
+            self.report({'ERROR'}, f"Module Load Error: {e}")
+            return {'CANCELLED'}
+
+        if not apply_func:
+            self.report({'ERROR'}, "physics_logic.py에서 apply_taper_to_chain 함수를 찾을 수 없습니다.")
+            return {'CANCELLED'}
+
+        # 2. 분배 모드(Use Dist) 활성화
+        b.wiggle_stiff_use_dist = True
+        b.wiggle_damp_use_dist = True
+        
+        # 3. 프리셋 타입에 따른 가변 범위 설정
+        if self.type == 'JELLY': 
+            s_start, s_end = 20.0, 5.0
+            d_start, d_end = 1.0, 0.1
+            b.wiggle_bounce, b.wiggle_gravity, b.wiggle_friction = 0.8, 0.5, 0.4
+        elif self.type == 'HAIR': 
+            s_start, s_end = 50.0, 0.0
+            d_start, d_end = 5.0, 0.0
+            b.wiggle_friction, b.wiggle_gravity, b.wiggle_bounce = 0.8, 1.0, 0.1
+        elif self.type == 'HEAVY': 
+            s_start, s_end = 40.0, 10.0
+            d_start, d_end = 4.0, 0.5
+            b.wiggle_gravity, b.wiggle_friction = 2.5, 0.9
+        elif self.type == 'CLOTH': 
+            s_start, s_end = 15.0, 2.0
+            d_start, d_end = 3.0, 0.5
+            b.wiggle_gravity, b.wiggle_friction = 0.8, 0.7
+        elif self.type == 'SPRING': 
+            s_start, s_end = 60.0, 30.0
+            d_start, d_end = 0.5, 0.1
+            b.wiggle_bounce, b.wiggle_gravity = 0.9, 0.3
+        elif self.type == 'ANTENNA': 
+            s_start, s_end = 50.0, 20.0
+            d_start, d_end = 0.8, 0.2
+            b.wiggle_bounce, b.wiggle_gravity = 0.5, 0.1
+        else:
+            return {'CANCELLED'}
+
+        # 4. UI 슬라이더 값 업데이트
+        scene.wiggle_stiff_start = s_start
+        scene.wiggle_stiff_end = s_end
+        scene.wiggle_damp_start = d_start
+        scene.wiggle_damp_end = d_end
+
+        # 5. 체인 전체에 즉시 분배 적용
+        apply_func(context, "wiggle_stiff", s_start, s_end)
+        apply_func(context, "wiggle_damp", d_start, d_end)
+
+        # 6. 물리 엔진 리셋
+        bpy.ops.wiggle.reset() 
+        
         return {'FINISHED'}
+
 
 
 class WiggleToggleBBox(bpy.types.Operator):
