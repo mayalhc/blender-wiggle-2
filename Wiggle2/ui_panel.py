@@ -287,8 +287,8 @@ def register():
             default='BOX'
         )
 
-    bpy.types.PoseBone.wiggle_angle_limit = bpy.props.FloatProperty(name="Angle Limit", default=180.0, min=0.0, max=180.0, precision=1)
-    bpy.types.PoseBone.wiggle_use_individual_limits = bpy.props.BoolProperty(name="Use Individual Limits", default=False)
+    bpy.types.PoseBone.wiggle_angle_limit = bpy.props.FloatProperty(name="Angle Limit",description="Hold Alt while pressing Enter to apply this limit to all selected bones",default=180.0, min=0.0, max=180.0, precision=1)
+    bpy.types.PoseBone.wiggle_use_individual_limits = bpy.props.BoolProperty(name="Use Individual Limits",description="Click to set separate limits for Up/Down (X) and Left/Right (Z) axes",default=False)
     bpy.types.PoseBone.wiggle_limit_x = bpy.props.FloatProperty(name="X Limit (Up-Down)", min=0.0, max=180.0, default=90.0, precision=1)
     bpy.types.PoseBone.wiggle_limit_z = bpy.props.FloatProperty(name="Z Limit (Left-Right)", min=0.0, max=180.0, default=90.0, precision=1)
 

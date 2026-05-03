@@ -28,8 +28,11 @@ def apply_taper_to_chain(target, attr, start_val, end_val):
 def wiggle_solve(context, obj, scene, delta_move):
     try:
         if not getattr(scene, "wiggle_enable", False): return
-        if getattr(scene, "wiggle_use_gpu", False):
-            physics_gpu.calculate_parallel(obj.pose.bones, scene, delta_move)
+        
+        # [수정] RTX 사용 여부에 따라 서브스텝 인자 전달
+        use_rtx = getattr(scene, "wiggle_use_gpu", False)
+        physics_gpu.calculate_parallel(obj.pose.bones, scene, delta_move, use_substeps=use_rtx)
+        
     except Exception as e:
         print(f"RTX Engine Warning: {e}")
 
@@ -38,12 +41,20 @@ class WIGGLE_OT_RTX_Turbo(bpy.types.Operator):
     bl_label = "RTX Turbo Mode"
     _timer = None
     _last_pos = {}
+    _last_gpu_state = True # 모드 전환 감시용
 
     def modal(self, context, event):
         scene = context.scene
         
+        # [원본 유지] 
         if not getattr(scene, "wiggle_use_gpu", False) or not scene.wiggle_enable:
             return self.cancel(context)
+
+        # [추가] RTX 체크박스를 끄면 캐시 즉시 삭제 (본 튀는 현상 방지)
+        if self._last_gpu_state != scene.wiggle_use_gpu:
+            if hasattr(physics_gpu, "reset_cache"):
+                physics_gpu.reset_cache()
+            self._last_gpu_state = scene.wiggle_use_gpu
 
         if event.type == 'TIMER':
             for obj in context.scene.objects:
@@ -71,8 +82,10 @@ class WIGGLE_OT_RTX_Turbo(bpy.types.Operator):
         if WIGGLE_OT_RTX_Turbo._timer is not None:
             return self.cancel(context)
         
+        # [원본 유지]
         context.scene.wiggle_use_gpu = True
         context.scene.wiggle_enable = True
+        self._last_gpu_state = context.scene.wiggle_use_gpu
         self._last_pos.clear()
         
         wm = context.window_manager
@@ -84,6 +97,7 @@ class WIGGLE_OT_RTX_Turbo(bpy.types.Operator):
 
     def cancel(self, context):
         print("<<< RTX ENGINE: STOPPED")
+        # [원본 유지]
         context.scene.wiggle_use_gpu = False
         
         # Reset physics cache to prevent preset value mismatch
@@ -97,6 +111,13 @@ class WIGGLE_OT_RTX_Turbo(bpy.types.Operator):
 
 def register():
     bpy.utils.register_class(WIGGLE_OT_RTX_Turbo)
+    # [로드 오류 해결] 필수 속성 자동 등록
+    if not hasattr(bpy.types.Scene, "wiggle_enable"):
+        bpy.types.Scene.wiggle_enable = bpy.props.BoolProperty(default=False)
+    if not hasattr(bpy.types.Scene, "wiggle_use_gpu"):
+        bpy.types.Scene.wiggle_use_gpu = bpy.props.BoolProperty(default=True)
+    if not hasattr(bpy.types.Object, "wiggle_mute"):
+        bpy.types.Object.wiggle_mute = bpy.props.BoolProperty(default=False)
 
 def unregister():
     if WIGGLE_OT_RTX_Turbo._timer:

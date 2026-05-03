@@ -8,27 +8,30 @@ _cache = {
     "count": 0,
 }
 
-# 2. 캐시 초기화 함수 (수정됨)
+# 2. 캐시 초기화 함수
 def reset_cache():
-    global _cache  # 이 줄이 반드시 있어야 합니다.
+    global _cache
     _cache["pos"] = None
     _cache["vel"] = None
     _cache["count"] = 0
     print(">>> RTX CACHE: RESET")
     
-def calculate_parallel(bones, scene, delta_move):
+# [수정] 네 번째 인자 use_substeps를 추가하여 'unexpected keyword' 에러를 해결했습니다.
+def calculate_parallel(bones, scene, delta_move, use_substeps=True):
     global _cache
     n = len(bones)
     if n == 0: return
 
     if _cache["count"] != n:
-        _cache["pos"] = [Vector((0,0,0)) for _ in range(n)]
+        _cache["pos"] = [b.head.copy() for b in bones]
         _cache["vel"] = [Vector((0,0,0)) for _ in range(n)]
         _cache["count"] = n
 
     fps = max(scene.render.fps, 1)
     base_dt = 1.0 / fps
-    sub_steps = 4
+    
+    # [로직] use_substeps 값에 따라 서브스텝 결정 (RTX 켜면 4단계, 끄면 1단계)
+    sub_steps = 4 if use_substeps else 1
     dt = base_dt / sub_steps
 
     obj = bpy.context.active_object
@@ -37,11 +40,11 @@ def calculate_parallel(bones, scene, delta_move):
     world_to_obj = obj.matrix_world.inverted()
     inertia = (world_to_obj.to_quaternion() @ (-delta_move))
 
-    root_pos = bones[0].head.copy()
-    _cache["pos"][0] = root_pos
+    # 루트 본 초기 위치 고정
+    _cache["pos"][0] = bones[0].head.copy()
     _cache["vel"][0] = Vector((0,0,0))
 
-    # 1. 시뮬레이션 로직 (원본 방식 유지하며 서브스텝만 적용)
+    # 1. 시뮬레이션 로직 (서브스텝 분기 및 Stiffness 보정 적용)
     for _ in range(sub_steps):
         for i in range(1, n):
             b = bones[i]
@@ -49,7 +52,12 @@ def calculate_parallel(bones, scene, delta_move):
             pos  = _cache["pos"][i]
             vel  = _cache["vel"][i]
 
+            # [핵심 보정] 서브스텝이 적용될 때만 stiff 값을 나누어 
+            # 프리셋 수치(예: 50)가 과하게 적용되어 본이 튀는 현상을 방지합니다.
             stiff   = getattr(b, "wiggle_stiff", 1.0)
+            if use_substeps:
+                stiff /= sub_steps
+                
             damp    = getattr(b, "wiggle_damp", 0.1)
             gravity = getattr(b, "wiggle_gravity", 0.0)
             stretch = getattr(b, "wiggle_stretch", 1.0)
@@ -61,13 +69,16 @@ def calculate_parallel(bones, scene, delta_move):
 
             target = prev + rest_dir * rest_len
 
-            # 원본 수식 그대로 유지 (dt만 서브스텝용 사용)
+            # 물리 연산
             vel += (target - pos) * stiff * dt
             vel += Vector((0,0,-gravity)) * dt
-            vel += inertia.project(rest_dir) * dt
+            # 관성도 서브스텝에 맞춰 분산 적용
+            vel += (inertia / sub_steps).project(rest_dir) * dt
+            
             vel *= (1.0 - damp * dt)
             pos += vel * dt
 
+            # 길이 제약 (Constraint)
             d = pos - prev
             if d.length < 1e-8: d = rest_dir
             else: d.normalize()
@@ -78,7 +89,7 @@ def calculate_parallel(bones, scene, delta_move):
             _cache["pos"][i] = pos
             _cache["vel"][i] = vel
 
-    # 2. 회전 적용 (사용자가 준 원본 방식 100% 동일하게 복구)
+    # 2. 회전 적용 (원본 방식 100% 유지)
     obj_inv = obj.matrix_world.inverted().to_3x3()
     
     for i in range(1, n):
@@ -99,6 +110,6 @@ def calculate_parallel(bones, scene, delta_move):
         q = rest_dir_pose.rotation_difference(target_dir_pose)
 
         b.rotation_mode = 'QUATERNION'
-        b.rotation_quaternion = q # 부모 매트릭스 계산 없이 원본대로 직접 대입
+        b.rotation_quaternion = q
 
     return True

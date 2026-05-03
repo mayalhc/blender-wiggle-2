@@ -975,35 +975,77 @@ class WiggleBake(bpy.types.Operator):
     def poll(cls,context):
         return context.object
     
-    def execute(self,context):
+    def execute(self, context):
+        # 1. Check if the active object is an Armature
+        obj = context.active_object
+        if not obj or obj.type != 'ARMATURE':
+            self.report({'WARNING'}, "Please select an Armature object first")
+            return {'CANCELLED'}
+
+        # 2. Ensure we are in Pose Mode for baking
+        if obj.mode != 'POSE':
+            try:
+                bpy.ops.object.mode_set(mode='POSE')
+            except Exception as e:
+                self.report({'ERROR'}, f"Failed to enter Pose Mode: {e}")
+                return {'CANCELLED'}
+
         def push_nla():
-            if context.scene.wiggle.bake_overwrite: return
-            if not context.scene.wiggle.bake_nla: return
-            if not context.object.animation_data: return
-            if not context.object.animation_data.action: return
-            action = context.object.animation_data.action
-            track = context.object.animation_data.nla_tracks.new()
-            track.name = action.name
-            track.strips.new(action.name, int(action.frame_range[0]), action)
+            # Check bake settings and animation data
+            wiggle = context.scene.wiggle
+            if wiggle.bake_overwrite: return
+            if not wiggle.bake_nla: return
             
+            anim_data = obj.animation_data
+            if not anim_data or not anim_data.action: return
+            
+            # Safe NLA Track Creation
+            action = anim_data.action
+            try:
+                track = anim_data.nla_tracks.new()
+                track.name = action.name
+                track.strips.new(action.name, int(action.frame_range[0]), action)
+                # Clear action from slot so it only exists in NLA
+                anim_data.action = None 
+            except Exception as e:
+                print(f"NLA Push Warning: {e}")
+            
+        # Execute NLA logic and Reset simulation
         push_nla()
-        
         bpy.ops.wiggle.reset()
             
         #preroll
         duration = context.scene.frame_end - context.scene.frame_start
         preroll = context.scene.wiggle.preroll
         context.scene.wiggle.is_preroll = False
-        bpy.ops.wiggle.select()
+
+        # --- FIX START: Bone Selection ---
+        # Ensure we are in POSE mode to select pose bones
+        if context.active_object.mode != 'POSE':
+            bpy.ops.object.mode_set(mode='POSE')
+
+        for b in context.active_object.pose.bones:
+            if getattr(b, "wiggle_enable", False):
+                b.select = True 
+                if hasattr(b, "bone"):
+                    b.select = True
+
+        # --- FIX END ---
+
         bpy.ops.wiggle.reset()
+
         while preroll >= 0:
             if context.scene.wiggle.loop:
-                frame = context.scene.frame_end - (preroll%duration)
-                context.scene.frame_set(frame)
+                # Avoid division by zero if start/end frames are the same
+                div = duration if duration > 0 else 1
+                frame = context.scene.frame_end - (preroll % div)
+                context.scene.frame_set(int(frame))
             else:
                 context.scene.frame_set(context.scene.frame_start)
+            
             context.scene.wiggle.is_preroll = True
             preroll -= 1
+
         #bake
         bpy.ops.nla.bake(frame_start = context.scene.frame_start,
                         frame_end = context.scene.frame_end,
