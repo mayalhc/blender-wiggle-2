@@ -1,10 +1,10 @@
 schema_version = "1.0.0"
 
-id = "wiggle_2"
-version = "2.1.7"
-name = "Wiggle 2 (5.0 Patched)"
+id = "wiggle_2_rtx"
+version = "2.1.8"
+name = "Wiggle 2: RTX Edition"
 
-tagline = "Pro wiggle physics for bones. Optimized for GroomForge"
+tagline = "Real-time Immortal RTX Engine — Optimized for GroomForge Hair Physics"
 maintainer = "Chamiseul"
 type = "add-on"
 

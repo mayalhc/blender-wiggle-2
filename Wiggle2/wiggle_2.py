@@ -8,8 +8,11 @@
 # weird glitch when starting playback?
 
 import bpy, math
+import gpu  # GPU 정보를 직접 읽기 위해 추가
+from . import physics_gpu  # 같은 폴더의 physics_gpu.py 파일 연결
 from bpy.app.handlers import persistent
 from mathutils import Vector, Matrix, Quaternion
+
 
 #return m2 in m1 space
 def relative_matrix(m1,m2):

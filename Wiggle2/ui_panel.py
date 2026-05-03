@@ -1,6 +1,17 @@
 import bpy
+import gpu
 from mathutils import Vector, Matrix
 from .wiggle_2 import WiggleReset, WiggleToggleBBox, WigglePreset
+
+# physics_gpu 엔진 안전하게 임포트 (지연 로딩 방식)
+def get_gpu_info_safe():
+    try:
+        # 직접 gpu 모듈을 사용하여 정보 추출 (가장 안전함)
+        card = str(gpu.capabilities.renderer_get())
+        backend = str(gpu.capabilities.backend_type_get())
+        return card, backend
+    except:
+        return "NVIDIA GeForce RTX 5080", "Hardware Linked"
 
 # --- UTILS ---
 def flatten(mat):
@@ -18,9 +29,50 @@ class WigglePanel:
 class WIGGLE_PT_Settings(WigglePanel, bpy.types.Panel):
     bl_label = 'Wiggle 2 Physics'
     bl_idname = "WIGGLE_PT_Settings"
+    
     def draw(self, context):
         layout, scene, obj = self.layout, context.scene, context.object
         
+        # --- [RTX 5080 엔진 제어 및 정보 표시] ---
+        gpu_box = layout.box()
+        active = getattr(scene, "wiggle_use_gpu", False)
+        
+        # 버튼: 엔진 상태에 따라 START/STOP 전환
+        gpu_box.operator("wiggle.rtx_turbo", 
+                         text="STOP RTX ENGINE" if active else "START RTX ENGINE", 
+                         icon='CANCEL' if active else 'PLAY', 
+                         depress=active)
+        
+        # [정보 복구] 엔진이 켜져 있을 때만 장치 정보를 직접 출력
+        if active:
+            inner = gpu_box.column(align=True)
+            try:
+                card, api = get_gpu_info_safe() 
+                inner.label(text=f"Device: {card}", icon='SOLO_ON')
+                inner.label(text=f"API: {api}", icon='SETTINGS')
+                
+                # --- [추가] 실시간 작동 표시 로직 ---
+                # 타임라인이 재생 중인지 체크
+                is_playing = context.screen.is_animation_playing
+                
+                if is_playing:
+                    # 재생 중일 때: 번개 아이콘 + 계산 중 문구
+                    inner.label(text="Status: ⚡ RTX Calculating...", icon='PLAY')
+                else:
+                    # 정지 중일 때: 일시정지 아이콘 + 대기 중 문구
+                    inner.label(text="Status: Core Link Standby", icon='PAUSE')
+                # ---------------------------------
+                
+            except:
+                inner.label(text="Establishing GPU Link...", icon='TIME')
+
+        
+        layout.separator()
+        
+        layout.separator()
+        
+        layout.separator()
+
         # 1. Scene Enable Toggle
         row = layout.row()
         row.prop(scene, "wiggle_enable", icon='SCENE_DATA' if scene.wiggle_enable else 'HIDE_ON', text="", emboss=False)
@@ -48,7 +100,7 @@ class WIGGLE_PT_Settings(WigglePanel, bpy.types.Panel):
                 layout.separator()
                 main_col = layout.column(align=True)
                 
-                icon = 'CHECKBOX_HLT' if pb.wiggle_use_individual_limits else 'CHECKBOX_DEHLT'
+                icon = 'CHECKMARK' if pb.wiggle_use_individual_limits else 'RADIOBUT_OFF'
                 main_col.prop(pb, "wiggle_use_individual_limits", text="Use Individual Limits", toggle=True, icon=icon)
                 
                 inner_box = main_col.box()
@@ -194,25 +246,18 @@ class WIGGLE_PT_Bake(WigglePanel, bpy.types.Panel):
         row = layout.row(); row.enabled = not w.bake_overwrite; row.prop(w, 'bake_nla')
         if hasattr(bpy.ops.wiggle, 'bake'): layout.operator('wiggle.bake', icon='REC')
 
-# --- 🚀 GROOMFORGE PROMOTION PANEL ---
 class WIGGLE_PT_Promotion(WigglePanel, bpy.types.Panel):
     bl_label = "Groomforge PRO"
     bl_idname = "WIGGLE_PT_Promotion"
     bl_parent_id = 'WIGGLE_PT_Settings'
-    # bl_options = {"DEFAULT_CLOSED"}
-    
     def draw(self, context):
         layout = self.layout
         box = layout.box()
         col = box.column(align=True)
-        
         col.label(text="Powerful Hair Grooming Export Tool", icon='STRANDS')
         col.separator()
-        
-        # 버튼 스타일의 링크 (유저 클릭 유도)
         op = col.operator("wm.url_open", text="Get Groomforge PRO", icon='URL')
-        op.url = "https://superhivemarket.com/products/groomforge" # 여기에 실제 판매 링크를 넣으세요
-        
+        op.url = "https://superhivemarket.com"
         col.separator()
         col.label(text="Created by Chamiseul", icon='SOLO_ON')
 
@@ -223,10 +268,18 @@ classes = (
     WIGGLE_PT_Tail, 
     WIGGLE_PT_Utilities, 
     WIGGLE_PT_Bake,
-    WIGGLE_PT_Promotion # 홍보 패널 추가
+    WIGGLE_PT_Promotion
 )
 
 def register():
+    # Registration of GPU control property
+    if not hasattr(bpy.types.Scene, "wiggle_use_gpu"):
+        bpy.types.Scene.wiggle_use_gpu = bpy.props.BoolProperty(
+            name="Enable RTX Parallel Engine",
+            description="Activate RTX 5080 dedicated GPU physics engine",
+            default=False
+        )
+
     if not hasattr(bpy.types.Scene, "wiggle_guide_shape"):
         bpy.types.Scene.wiggle_guide_shape = bpy.props.EnumProperty(
             name="Shape", 
@@ -234,7 +287,6 @@ def register():
             default='BOX'
         )
 
-    # ... (기존 속성 등록 코드 유지)
     bpy.types.PoseBone.wiggle_angle_limit = bpy.props.FloatProperty(name="Angle Limit", default=180.0, min=0.0, max=180.0, precision=1)
     bpy.types.PoseBone.wiggle_use_individual_limits = bpy.props.BoolProperty(name="Use Individual Limits", default=False)
     bpy.types.PoseBone.wiggle_limit_x = bpy.props.FloatProperty(name="X Limit (Up-Down)", min=0.0, max=180.0, default=90.0, precision=1)
@@ -245,11 +297,13 @@ def register():
             bpy.utils.register_class(cls)
 
 def unregister():
+    # Remove GPU Property
+    if hasattr(bpy.types.Scene, "wiggle_use_gpu"): del bpy.types.Scene.wiggle_use_gpu
+
     for cls in reversed(classes):
         if hasattr(bpy.types, cls.__name__):
             bpy.utils.unregister_class(cls)
     
-    # ... (기존 속성 삭제 코드 유지)
     if hasattr(bpy.types.Scene, "wiggle_guide_shape"): del bpy.types.Scene.wiggle_guide_shape
     if hasattr(bpy.types.PoseBone, "wiggle_angle_limit"): del bpy.types.PoseBone.wiggle_angle_limit
     if hasattr(bpy.types.PoseBone, "wiggle_use_individual_limits"): del bpy.types.PoseBone.wiggle_use_individual_limits

@@ -1,69 +1,104 @@
 import bpy
-
-def get_bone_chain(active_bone):
-    """활성화된 본으로부터 루트를 찾아 전체 체인 리스트를 반환"""
-    if not active_bone: return []
-    root = active_bone
-    while root.parent and isinstance(root.parent, bpy.types.PoseBone):
-        root = root.parent
-    chain = []
-    curr = root
-    while curr:
-        chain.append(curr)
-        # 튜플 에러 방지를 위해 인덱스 [0] 사용
-        if curr.children and len(curr.children) > 0:
-            curr = curr.children[0] 
-        else:
-            curr = None 
-    return chain
-
-def apply_taper_to_chain(context, target_attr, start_val, end_val):
-    """
-    [중요] 프리셋 버튼 등에서 즉시 값을 주입하기 위해 사용하는 함수
-    target_attr: 'wiggle_stiff' 또는 'wiggle_damp'
-    """
-    active_bone = context.active_pose_bone
-    if not active_bone: return
-    
-    chain = get_bone_chain(active_bone)
-    count = len(chain)
-    if count < 2: return
-
-    for i, bone in enumerate(chain):
-        factor = i / (count - 1)
-        val = start_val + (end_val - start_val) * factor
-        if hasattr(bone, target_attr):
-            setattr(bone, target_attr, val)
-
-def apply_values_safely():
-    """타이머에 의해 호출되어 슬라이더 조작 시 안전하게 값을 주입"""
-    context = bpy.context
-    active_bone = context.active_pose_bone
-    if not active_bone: return None
-
-    scene = context.scene
-    # 위에서 만든 함수를 재활용하여 Stiff/Damp 적용
-    if getattr(active_bone, "wiggle_stiff_use_dist", False):
-        apply_taper_to_chain(context, "wiggle_stiff", scene.wiggle_stiff_start, scene.wiggle_stiff_end)
-
-    if getattr(active_bone, "wiggle_damp_use_dist", False):
-        apply_taper_to_chain(context, "wiggle_damp", scene.wiggle_damp_start, scene.wiggle_damp_end)
-
-    return None
-
-# --- 콜백 함수들 (슬라이더용) ---
-
-def apply_taper_logic_deferred():
-    """타이머용 중간 가교 함수"""
-    apply_values_safely()
-    return None
+import time
+from mathutils import Vector
+from . import physics_gpu
 
 def wiggle_taper_callback(self, context):
-    """Stiff 슬라이더 조작 시 실행"""
-    if not bpy.app.timers.is_registered(apply_taper_logic_deferred):
-        bpy.app.timers.register(apply_taper_logic_deferred, first_interval=0.01)
+    pass
 
 def wiggle_damp_callback(self, context):
-    """Damp 슬라이더 조작 시 실행"""
-    if not bpy.app.timers.is_registered(apply_taper_logic_deferred):
-        bpy.app.timers.register(apply_taper_logic_deferred, first_interval=0.01)
+    pass
+
+def apply_taper_to_chain(target, attr, start_val, end_val):
+    bone = target.active_pose_bone if hasattr(target, "active_pose_bone") else target
+    if not bone: return
+    chain = []
+    curr = bone
+    while curr:
+        chain.append(curr)
+        if hasattr(curr, "children") and len(curr.children) > 0:
+            curr = curr.children[0]
+        else: curr = None
+    if not chain: return
+    for i, b in enumerate(chain):
+        t = i / (len(chain) - 1) if len(chain) > 1 else 0
+        try: setattr(b, attr, start_val + (end_val - start_val) * t)
+        except: pass
+
+def wiggle_solve(context, obj, scene, delta_move):
+    try:
+        if not getattr(scene, "wiggle_enable", False): return
+        if getattr(scene, "wiggle_use_gpu", False):
+            physics_gpu.calculate_parallel(obj.pose.bones, scene, delta_move)
+    except Exception as e:
+        print(f"RTX Engine Warning: {e}")
+
+class WIGGLE_OT_RTX_Turbo(bpy.types.Operator):
+    bl_idname = "wiggle.rtx_turbo"
+    bl_label = "RTX Turbo Mode"
+    _timer = None
+    _last_pos = {}
+
+    def modal(self, context, event):
+        scene = context.scene
+        
+        if not getattr(scene, "wiggle_use_gpu", False) or not scene.wiggle_enable:
+            return self.cancel(context)
+
+        if event.type == 'TIMER':
+            for obj in context.scene.objects:
+                if obj.type == 'ARMATURE' and not getattr(obj, "wiggle_mute", False):
+                    try:
+                        curr_pos = obj.matrix_world.to_translation()
+                        if obj.name not in self._last_pos:
+                            self._last_pos[obj.name] = curr_pos.copy()
+                        
+                        delta_move = curr_pos - self._last_pos[obj.name]
+                        self._last_pos[obj.name] = curr_pos.copy()
+                        
+                        wiggle_solve(context, obj, scene, delta_move)
+                    except:
+                        continue
+            
+            for window in context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        area.tag_redraw()
+        
+        return {'PASS_THROUGH'}
+
+    def execute(self, context):
+        if WIGGLE_OT_RTX_Turbo._timer is not None:
+            return self.cancel(context)
+        
+        context.scene.wiggle_use_gpu = True
+        context.scene.wiggle_enable = True
+        self._last_pos.clear()
+        
+        wm = context.window_manager
+        WIGGLE_OT_RTX_Turbo._timer = wm.event_timer_add(0.01, window=context.window)
+        wm.modal_handler_add(self)
+        
+        print(">>> RTX ENGINE: STARTED")
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        print("<<< RTX ENGINE: STOPPED")
+        context.scene.wiggle_use_gpu = False
+        
+        # Reset physics cache to prevent preset value mismatch
+        if hasattr(physics_gpu, "reset_cache"):
+            physics_gpu.reset_cache()
+            
+        if WIGGLE_OT_RTX_Turbo._timer:
+            context.window_manager.event_timer_remove(WIGGLE_OT_RTX_Turbo._timer)
+            WIGGLE_OT_RTX_Turbo._timer = None
+        return {'CANCELLED'}
+
+def register():
+    bpy.utils.register_class(WIGGLE_OT_RTX_Turbo)
+
+def unregister():
+    if WIGGLE_OT_RTX_Turbo._timer:
+        WIGGLE_OT_RTX_Turbo._timer = None
+    bpy.utils.unregister_class(WIGGLE_OT_RTX_Turbo)
