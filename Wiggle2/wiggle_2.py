@@ -727,89 +727,109 @@ def wiggle_pre(scene, depsgraph=None):
             if (pb.wiggle_head or pb.wiggle_tail) and not pb.wiggle_mute:
                 pass
 
-@persistent                
+@persistent
 def wiggle_post(scene, dg):
-    if (scene.wiggle.lastframe == scene.frame_current) and not scene.wiggle.reset: return
-    if scene.wiggle.reset: return
-    if not scene.wiggle_enable: return
-    if scene.wiggle.is_rendering: return
-
-    lastframe = scene.wiggle.lastframe
-    curr_frame = scene.frame_current
+    w = scene.wiggle
+    cf = scene.frame_current
     
-    if (curr_frame <= scene.frame_start) or (curr_frame < lastframe):
-        for wo in scene.wiggle.list:
+    # 1. 실행 조건 체크
+    if (w.lastframe == cf) and not w.reset and cf > scene.frame_start: return
+    if w.reset or not scene.wiggle_enable or w.is_rendering: return
+
+    lastframe = w.lastframe
+    
+    # 2. [Auto Loop 핵심] 리셋 및 루핑 로직
+    if (cf <= scene.frame_start) or (cf < lastframe):
+        use_loop = getattr(scene, "wiggle_use_loop", False)
+        for wo in w.list:
             ob = scene.objects.get(wo.name)
             if not ob: continue
             for wb in wo.list:
                 b = ob.pose.bones.get(wb.name)
                 if not b: continue
-                b.wiggle.position = b.wiggle.position_last = Vector((0,0,0))
-                b.wiggle.position_head = b.wiggle.position_last_head = Vector((0,0,0))
-                b.wiggle.velocity = b.wiggle.velocity_head = Vector((0,0,0))
-        
-        scene.wiggle.lastframe = curr_frame
-        scene.wiggle.reset = False
-        if hasattr(scene, "wiggle") and scene.wiggle:
-            try:
-                bpy.ops.wiggle.reset()
-            except Exception as e:
-                print(f"Wiggle reset skipped: {e}")
+                bw = b.wiggle
+                if not use_loop:
+                    m = ob.matrix_world @ b.matrix
+                    pos = m.to_translation()
+                    bw.position = bw.position_last = pos.copy()
+                    bw.velocity = Vector((0,0,0))
+                update_matrix(b, True)
+        w.lastframe = cf
+        w.reset = False
         return
 
-    if curr_frame >= lastframe:
-        frames_elapsed = curr_frame - lastframe
-    else:
-        e1 = (scene.frame_end - lastframe) + (curr_frame - scene.frame_start) + 1
-        e2 = lastframe - curr_frame
-        frames_elapsed = min(e1, e2)
-        
-    if frames_elapsed > 4: frames_elapsed = 1
-    if scene.wiggle.is_preroll: frames_elapsed = 1
-    
-    scene.wiggle.dt = (1.0 / max(1.0, scene.render.fps)) * frames_elapsed
-    scene.wiggle.lastframe = curr_frame
+    # 3. 시간 계산
+    frames_elapsed = cf - lastframe if cf >= lastframe else 1
+    fe = 1 if (frames_elapsed > 4 or w.is_preroll) else frames_elapsed
+    w.dt = (1.0 / max(1.0, scene.render.fps)) * fe
+    w.lastframe = cf
 
-    for wo in scene.wiggle.list:
+    # --- [3번 신규 로직: Safety Guard 속도 감지] ---
+    # per-armature로 정확하게 계산 (이전 코드에서는 w.delta_move가 없어서 항상 0이었음)
+
+    # 4. 메인 루프
+    for wo in w.list:
         ob = scene.objects.get(wo.name)
-        if not ob or ob.wiggle_mute or ob.wiggle_freeze: continue
-        
-        bones = []
-        for wb in wo.list:
-            b = ob.pose.bones.get(wb.name)
-            if not b or b.wiggle_mute or not (b.wiggle_head or b.wiggle_tail): continue
-            bones.append(b)
-            
-        if not bones: continue
+        if not ob or ob.wiggle_mute: continue
 
-        for b in bones:
-            b.wiggle.collision_normal = b.wiggle.collision_normal_head = Vector((0,0,0))
+        # ====================== Safety Boost 계산 (아마추어 개별) ======================
+        safety_boost = 0.0
+        if getattr(scene, "wiggle_adaptive_damping", False):
+            if not hasattr(w, "last_ob_pos"):
+                w.last_ob_pos = {}
+
+            current_pos = ob.matrix_world.translation.copy()
+            last_pos = w.last_ob_pos.get(ob.name, current_pos)
+
+            delta_move = current_pos - last_pos
+            obj_speed = delta_move.length / w.dt if w.dt > 0 else 0
+
+            threshold = 5.0                                      # 빠른 움직임 감지 기준 (필요시 조정)
+            sensitivity = getattr(scene, "wiggle_safety_threshold", 10.0)  # ← UI의 Sensitivity 값
+
+            if obj_speed > threshold:
+                excess = obj_speed - threshold
+                safety_boost = excess * sensitivity
+                # safety_boost = excess * (sensitivity * 0.4)      # Sensitivity 10.0 기준으로 *4.0 강도
+
+            w.last_ob_pos[ob.name] = current_pos
+
+        bones = [ob.pose.bones.get(wb.name) for wb in wo.list 
+                 if ob.pose.bones.get(wb.name) and not ob.pose.bones.get(wb.name).wiggle_mute]
+        
+        active_bones = [b for b in bones if getattr(b, "wiggle_influence", 1.0) > 0.0]
+        if not active_bones: continue
+
+        orig_rots = {b.name: b.rotation_quaternion.copy() if b.rotation_mode == 'QUATERNION' 
+                     else b.rotation_euler.to_quaternion() for b in active_bones}
+
+        for b in active_bones:
+            # [Safety Guard 반영]
+            b.wiggle.adaptive_damp_mod = safety_boost 
             move(b, dg)
             
-        for i in range(max(1, scene.wiggle.iterations)):
-            for b in bones:
-                constrain(b, scene.wiggle.iterations - 1 - i, dg)
+        for i in range(max(1, w.iterations)):
+            for b in active_bones:
+                constrain(b, w.iterations - 1 - i, dg)
         
-        for b in bones:
+        for b in active_bones:
             update_matrix(b, True)
-            
-        if frames_elapsed:
-            fe = max(frames_elapsed, 1)
-            for b in bones:
-                vb = Vector((0,0,0))
-                if b.wiggle.collision_normal.length > 0.001:
-                    vb = b.wiggle.velocity.reflect(b.wiggle.collision_normal).project(b.wiggle.collision_normal) * b.wiggle_bounce
-                b.wiggle.velocity = (b.wiggle.position - b.wiggle.position_last) / fe + vb
-                
-                vb_h = Vector((0,0,0)) 
-                if b.wiggle.collision_normal_head.length > 0.001:
-                    vb_h = b.wiggle.velocity_head.reflect(b.wiggle.collision_normal_head).project(b.wiggle.collision_normal_head) * b.wiggle_bounce_head
-                b.wiggle.velocity_head = (b.wiggle.position_head - b.wiggle.position_last_head) / fe + vb_h
-                
-                b.wiggle.position_last = b.wiggle.position.copy()
-                b.wiggle.position_last_head = b.wiggle.position_head.copy()
+            inf = getattr(b, "wiggle_influence", 1.0)
+            if inf < 1.0:
+                sim_q = b.rotation_quaternion.copy()
+                anim_q = orig_rots.get(b.name, Quaternion((1,0,0,0)))
+                b.rotation_quaternion = anim_q.slerp(sim_q, inf)
+                update_matrix(b, True)
+
+        # 5. 속도 업데이트
+        for b in active_bones:
+            bw = b.wiggle
+            bw.velocity = (bw.position - bw.position_last) / fe
+            bw.position_last = bw.position.copy()
         
         ob.update_tag()
+
+
 
 @persistent        
 def wiggle_render_pre(scene):
