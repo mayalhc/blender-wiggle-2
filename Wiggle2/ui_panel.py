@@ -33,44 +33,31 @@ class WIGGLE_PT_Settings(WigglePanel, bpy.types.Panel):
     def draw(self, context):
         layout, scene, obj = self.layout, context.scene, context.object
         
-        # --- [RTX 5080 엔진 제어 및 정보 표시] ---
-        gpu_box = layout.box()
-        active = getattr(scene, "wiggle_use_gpu", False)
-        
-        # 버튼: 엔진 상태에 따라 START/STOP 전환
-        gpu_box.operator("wiggle.rtx_turbo", 
-                         text="STOP RTX ENGINE" if active else "START RTX ENGINE", 
-                         icon='CANCEL' if active else 'PLAY', 
-                         depress=active)
-        
-        # [정보 복구] 엔진이 켜져 있을 때만 장치 정보를 직접 출력
-        if active:
-            inner = gpu_box.column(align=True)
-            try:
-                card, api = get_gpu_info_safe() 
-                inner.label(text=f"Device: {card}", icon='SOLO_ON')
-                inner.label(text=f"API: {api}", icon='SETTINGS')
-                
-                # --- [추가] 실시간 작동 표시 로직 ---
-                # 타임라인이 재생 중인지 체크
-                is_playing = context.screen.is_animation_playing
-                
-                if is_playing:
-                    # 재생 중일 때: 번개 아이콘 + 계산 중 문구
-                    inner.label(text="Status: ⚡ RTX Calculating...", icon='PLAY')
-                else:
-                    # 정지 중일 때: 일시정지 아이콘 + 대기 중 문구
-                    inner.label(text="Status: Core Link Standby", icon='PAUSE')
-                # ---------------------------------
-                
-            except:
-                inner.label(text="Establishing GPU Link...", icon='TIME')
+        # --- [RTX 엔진 제어 UI - 주석 처리됨] ---
+        # gpu_box = layout.box()
+        # active = getattr(scene, "wiggle_use_gpu", False)
+        # 
+        # gpu_box.operator("wiggle.rtx_turbo", 
+        #                  text="STOP RTX ENGINE" if active else "START RTX ENGINE", 
+        #                  icon='CANCEL' if active else 'PLAY', 
+        #                  depress=active)
+        # 
+        # if active:
+        #     inner = gpu_box.column(align=True)
+        #     try:
+        #         card, api = get_gpu_info_safe() 
+        #         inner.label(text=f"Device: {card}", icon='SOLO_ON')
+        #         inner.label(text=f"API: {api}", icon='SETTINGS')
+        #         
+        #         is_playing = context.screen.is_animation_playing
+        #         if is_playing:
+        #             inner.label(text="Status: ⚡ RTX Calculating...", icon='PLAY')
+        #         else:
+        #             inner.label(text="Status: Core Link Standby", icon='PAUSE')
+        #     except:
+        #         inner.label(text="Establishing GPU Link...", icon='TIME')
+        # ------------------------------------------
 
-        
-        layout.separator()
-        
-        layout.separator()
-        
         layout.separator()
 
         # 1. Scene Enable Toggle
@@ -110,6 +97,7 @@ class WIGGLE_PT_Settings(WigglePanel, bpy.types.Panel):
                     col.prop(pb, "wiggle_limit_z", text="Z (right and left)")
                 else:
                     inner_box.prop(pb, "wiggle_angle_limit", text="Total Limit")
+
 
 
 class WIGGLE_PT_Tail(WigglePanel, bpy.types.Panel):
