@@ -1,5 +1,6 @@
 import bpy
 import gpu
+from . import wiggle_layers
 from mathutils import Vector, Matrix
 from .wiggle_2 import WiggleReset, WiggleToggleBBox, WigglePreset
 
@@ -26,8 +27,6 @@ class WigglePanel:
     bl_region_type = 'UI'
     @classmethod
     def poll(cls, context): return context.object is not None
-
-import bpy
 
 class WIGGLE_PT_Settings(WigglePanel, bpy.types.Panel):
     bl_label = 'Wiggle 2 Physics'
@@ -85,19 +84,7 @@ class WIGGLE_PT_Settings(WigglePanel, bpy.types.Panel):
                 row.prop(pb, 'wiggle_mute', icon='BONE_DATA' if not pb.wiggle_mute else 'HIDE_ON', 
                          icon_only=True, invert_checkbox=True, emboss=False)
 
-                # --- [신규 추가: Sim vs Anim Mix 슬라이더 + 일괄 적용 버튼] ---
-                layout.separator()
-                mix_box = layout.box()
-                mix_box.label(text="Physics Blending", icon='WRENCH' if 'WRENCH' in bpy.types.UILayout.bl_rna.functions['prop'].parameters['icon'].enum_items else 'PROPERTIES')
-                
-                row = mix_box.row(align=True)
-                # 현재 본의 슬라이더
-                row.prop(pb, "wiggle_influence", text="Sim Mix", slider=True)
-                # [핵심] 하위 체인 전체에 현재 믹스 값을 복사하는 버튼
-                row.operator("wiggle.apply_mix_to_chain", text="", icon='LINKED')
-                # ------------------------------------------------------------
-
-                # 4. Limit Settings
+                # 4. Limit Settings (Sim Mix가 삭제된 자리 바로 뒤)
                 layout.separator()
                 main_col = layout.column(align=True)
                 
@@ -105,12 +92,75 @@ class WIGGLE_PT_Settings(WigglePanel, bpy.types.Panel):
                 main_col.prop(pb, "wiggle_use_individual_limits", text="Use Individual Limits", toggle=True, icon=icon)
                 
                 inner_box = main_col.box()
-                if pb.wiggle_use_individual_limits:
+                if getattr(pb, "wiggle_use_individual_limits", False):
                     col = inner_box.column(align=True)
                     col.prop(pb, "wiggle_limit_x", text="X (up and down)")
                     col.prop(pb, "wiggle_limit_z", text="Z (right and left)")
                 else:
                     inner_box.prop(pb, "wiggle_angle_limit", text="Total Limit")
+
+
+class WIGGLE_PT_SimMixLayer_v3(bpy.types.Panel):
+    bl_label = 'Sim Mix Layers'
+    bl_idname = "WIGGLE_PT_SimMixLayer_v3"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Wiggle 2'
+    bl_parent_id = "WIGGLE_PT_Settings" 
+
+    def draw(self, context):
+        layout = self.layout
+        # [수정] 포즈 본이 아닌 활성 오브젝트를 가져옵니다.
+        obj = context.active_object
+        
+        # 오브젝트가 없거나, 리스트 속성이 없는 경우를 대비한 예외 처리
+        if not obj:
+            layout.label(text="No active object selected")
+            return
+
+        # 1. 상단: 레이어 리스트 (Object의 wiggle_layers 참조)
+        row = layout.row()
+        # [수정] pb 대신 obj를 사용합니다.
+        row.template_list("WIGGLE_UL_SimMixLayers", "", obj, "wiggle_layers", obj, "wiggle_layer_index")
+        
+        col = row.column(align=True)
+        col.operator("wiggle.layer_action", icon='ADD', text="").action = 'ADD'
+        col.operator("wiggle.layer_action", icon='REMOVE', text="").action = 'REMOVE'
+        col.separator()
+        col.operator("wiggle.layer_action", icon='TRIA_UP', text="").action = 'UP'
+        col.operator("wiggle.layer_action", icon='TRIA_DOWN', text="").action = 'DOWN'
+
+        # 2. 하단 상세 설정 박스
+        if hasattr(obj, "wiggle_layers") and len(obj.wiggle_layers) > 0:
+            active_layer = obj.wiggle_layers[obj.wiggle_layer_index]
+            box = layout.box()
+            box.label(text=f"Mix Settings: {active_layer.name}", icon='SETTINGS')
+            
+            # [입력 1] 레이어 적용 확률
+            row = box.row(align=True)
+            row.prop(active_layer, "influence", text="Layer Weight (%)", slider=True)
+            
+            # [입력 2] 해당 레이어의 실제 물리 강도
+            row = box.row(align=True)
+            row.prop(active_layer, "sim_mix", text="Sim Mix (Physics)", slider=True)
+            # 오브젝트 모드용 오퍼레이터로 이름이 동일하다면 유지, 다르다면 확인 필요
+            row.operator("wiggle.apply_mix_to_chain", text="", icon='LINKED')
+            
+            # 레이어 타입 선택
+            row = box.row(align=True)
+            row.prop(active_layer, "type", expand=True)
+            
+            # 3. 최종 베이크 버튼
+            layout.separator()
+            row = layout.row()
+            row.scale_y = 1.2
+            row.operator("wiggle.bake_combined", icon='RENDER_ANIMATION', text="Bake Result C")
+        else:
+            layout.label(text="Add a layer to start", icon='INFO')
+
+
+
+
 
 # ----------------------------------------------------------------
 # 이 오퍼레이터는 별도의 파일이나 wiggle_2.py의 register 부분에 있어야 합니다.
@@ -139,7 +189,6 @@ class WIGGLE_OT_ApplyMixToChain(bpy.types.Operator):
         context.area.tag_redraw()
         self.report({'INFO'}, f"Mix {target_val:.2f} applied to chain.")
         return {'FINISHED'}
-
 
 
 
@@ -277,8 +326,7 @@ class WIGGLE_PT_Bake(WigglePanel, bpy.types.Panel):
         w = scene.wiggle
         layout.use_property_split = True
 
-        # --- [신규 추가: Loop Physics] ---
-        # 베이크 시 루핑 여부를 여기서 바로 제어합니다.
+        # Loop Physics 설정
         layout.prop(scene, "wiggle_use_loop", text="Loop Physics", icon='LOOP_FORWARDS', toggle=True)
         layout.separator()
 
@@ -290,8 +338,12 @@ class WIGGLE_PT_Bake(WigglePanel, bpy.types.Panel):
         row.enabled = not w.bake_overwrite
         row.prop(w, 'bake_nla')
         
-        if hasattr(bpy.ops.wiggle, 'bake'):
+        # [수정 부분] 기존 wiggle.bake 대신 물리 끄기 로직이 포함된 bake_combined 호출
+        if hasattr(bpy.ops.wiggle, 'bake_combined'):
+            layout.operator('wiggle.bake_combined', text="Bake (with Auto-Off)", icon='REC')
+        elif hasattr(bpy.ops.wiggle, 'bake'):
             layout.operator('wiggle.bake', icon='REC')
+
 
 class WIGGLE_PT_Safety(WigglePanel, bpy.types.Panel):
     bl_label = 'Wiggle Safety Guard'
@@ -343,49 +395,45 @@ class WIGGLE_PT_Promotion(WigglePanel, bpy.types.Panel):
 
 
 # --- REGISTRATION ---
+
 classes = (
-    WIGGLE_PT_Settings,        # 메인 패널 (부모)
-    WIGGLE_OT_ApplyMixToChain, # Sim Mix 전파 도구  # [체크] 엔진 토글 도구 (만약 오퍼레이터 방식을 썼다면 추가)
-    WIGGLE_PT_Safety,          # 3번 기능: 세이프티 가드
-    WIGGLE_PT_Head,            # 헤드 설정
-    WIGGLE_PT_Tail,            # 테일 설정
-    WIGGLE_PT_Utilities,       # 유틸리티 (부모)
-    WIGGLE_PT_Bake,            # 베이크 (유틸리티 자식)
-    WIGGLE_PT_Promotion        # 홍보/정보 패널
+    WIGGLE_PT_Settings,          # 메인 부모 패널
+    WIGGLE_PT_SimMixLayer_v3,    # [수정] 오브젝트 모드 대응 패널
+    WIGGLE_PT_Safety,            # 세이프티 가드 패널
+    WIGGLE_PT_Head,              # 헤드 설정 패널
+    WIGGLE_PT_Tail,              # 테일 설정 패널
+    WIGGLE_PT_Utilities,         # 유틸리티 부모 패널
+    WIGGLE_PT_Bake,              # 베이크 패널
+    WIGGLE_PT_Promotion,         # 홍보 패널
+    
+    WIGGLE_OT_ApplyMixToChain,    # 오퍼레이터
 )
 
 def register():
-    # 1. 클래스 등록 (중복 방지 로직 포함)
+    # 1. 클래스 등록
     for cls in classes:
-        if not hasattr(bpy.types, cls.__name__):
-            bpy.utils.register_class(cls)
-    
+        try:
+            if not hasattr(bpy.types, cls.bl_idname if hasattr(cls, 'bl_idname') else cls.__name__):
+                bpy.utils.register_class(cls)
+        except RuntimeError as e:
+            print(f"Wiggle 2 Registration Error ({cls.__name__}): {e}")
+
     # 2. 씬(Scene) 단위 속성 등록
-    # [3번 기능] 세이프티 가드
     bpy.types.Scene.wiggle_adaptive_damping = bpy.props.BoolProperty(
-        name="Safety Guard", 
-        default=True, 
-        description="급격한 움직임 시 본이 튀는 것을 자동 방지"
+        name="Safety Guard", default=True, 
+        description="Automatic Bone Pop Prevention"
     )
     bpy.types.Scene.wiggle_safety_threshold = bpy.props.FloatProperty(
-        name="Sensitivity", 
-        default=1.0, min=0.1, max=10.0, 
-        description="방어 기작이 작동하는 속도 민감도"
+        name="Sensitivity", default=1.0, min=0.1, max=10.0, 
+        description="Defense Trigger Sensitivity"
     )
-    
-    # [5번 기능] 루프 피직스
     bpy.types.Scene.wiggle_use_loop = bpy.props.BoolProperty(
-        name="Loop Physics",
-        default=False,
-        description="마지막 프레임의 물리력을 첫 프레임으로 전달하여 루프 애니메이션을 만듭니다"
+        name="Loop Physics", default=False,
+        description="Transfer physics from the last frame to the first to create a loop"
     )
-    
-    # RTX 엔진 (주석 처리했던 기능의 백엔드 속성)
     bpy.types.Scene.wiggle_use_gpu = bpy.props.BoolProperty(
-        name="Enable RTX Parallel Engine",
-        default=False
+        name="Enable RTX Parallel Engine", default=False
     )
-    
     bpy.types.Scene.wiggle_guide_shape = bpy.props.EnumProperty(
         name="Shape", 
         items=[('BOX', "Box", ""), ('CYLINDER', "Cylinder", ""), ('CAPSULE', "Capsule", "")], 
@@ -393,21 +441,17 @@ def register():
     )
 
     # 3. 본(PoseBone) 단위 속성 등록
-    # [4번 기능] Sim Mix (Influence)
     bpy.types.PoseBone.wiggle_influence = bpy.props.FloatProperty(
-        name="Sim Mix", 
-        default=1.0, min=0.0, max=1.0, 
+        name="Sim Mix", default=1.0, min=0.0, max=1.0, 
         description="애니메이션과 물리 믹스 비율 (0=애니메이션, 1=물리)"
     )
-
-    # [리미트 설정] (AttributeError 해결 핵심)
     bpy.types.PoseBone.wiggle_use_individual_limits = bpy.props.BoolProperty(
-        name="Use Individual Limits",
-        default=False,
-        description="X축(상하)과 Z축(좌우) 리미트를 개별적으로 설정합니다"
+        name="Use Individual Limits", default=False,
+        description="Configure the X-axis and Z-axis limits separately"
     )
     bpy.types.PoseBone.wiggle_angle_limit = bpy.props.FloatProperty(
-        name="Angle Limit", default=180.0, min=0.0, max=180.0, precision=1
+        name="Angle Limit", default=180.0, min=0.0, max=180.0, precision=1,
+        description="Press Alt + Enter to apply change to the entire skeleton"
     )
     bpy.types.PoseBone.wiggle_limit_x = bpy.props.FloatProperty(
         name="X Limit", min=0.0, max=180.0, default=90.0, precision=1
@@ -416,22 +460,33 @@ def register():
         name="Z Limit", min=0.0, max=180.0, default=90.0, precision=1
     )
 
+    # 4. [추가] 오브젝트(Object) 단위 속성 등록 (UI 리스트 작동을 위해 필수)
+    if hasattr(bpy.types, "WiggleLayerPropGroup"):
+        bpy.types.Object.wiggle_layers = bpy.props.CollectionProperty(type=bpy.types.WiggleLayerPropGroup)
+        bpy.types.Object.wiggle_layer_index = bpy.props.IntProperty(name="Layer Index", default=0)
+
 def unregister():
-    # 1. 씬 속성 삭제
-    if hasattr(bpy.types.Scene, "wiggle_adaptive_damping"): del bpy.types.Scene.wiggle_adaptive_damping
-    if hasattr(bpy.types.Scene, "wiggle_safety_threshold"): del bpy.types.Scene.wiggle_safety_threshold
-    if hasattr(bpy.types.Scene, "wiggle_use_loop"): del bpy.types.Scene.wiggle_use_loop
-    if hasattr(bpy.types.Scene, "wiggle_use_gpu"): del bpy.types.Scene.wiggle_use_gpu
-    if hasattr(bpy.types.Scene, "wiggle_guide_shape"): del bpy.types.Scene.wiggle_guide_shape
-
-    # 2. 본 속성 삭제
-    if hasattr(bpy.types.PoseBone, "wiggle_influence"): del bpy.types.PoseBone.wiggle_influence
-    if hasattr(bpy.types.PoseBone, "wiggle_use_individual_limits"): del bpy.types.PoseBone.wiggle_use_individual_limits
-    if hasattr(bpy.types.PoseBone, "wiggle_angle_limit"): del bpy.types.PoseBone.wiggle_angle_limit
-    if hasattr(bpy.types.PoseBone, "wiggle_limit_x"): del bpy.types.PoseBone.wiggle_limit_x
-    if hasattr(bpy.types.PoseBone, "wiggle_limit_z"): del bpy.types.PoseBone.wiggle_limit_z
-
-    # 3. 클래스 해제 (역순)
+    # 1. 클래스 해제
     for cls in reversed(classes):
-        if hasattr(bpy.types, cls.__name__):
+        if hasattr(bpy.types, cls.bl_idname if hasattr(cls, 'bl_idname') else cls.__name__):
             bpy.utils.unregister_class(cls)
+
+    # 2. 씬 속성 삭제
+    props_scene = [
+        "wiggle_adaptive_damping", "wiggle_safety_threshold", 
+        "wiggle_use_loop", "wiggle_use_gpu", "wiggle_guide_shape"
+    ]
+    for p in props_scene:
+        if hasattr(bpy.types.Scene, p): delattr(bpy.types.Scene, p)
+
+    # 3. 본 속성 삭제
+    props_bone = [
+        "wiggle_influence", "wiggle_use_individual_limits", 
+        "wiggle_angle_limit", "wiggle_limit_x", "wiggle_limit_z"
+    ]
+    for p in props_bone:
+        if hasattr(bpy.types.PoseBone, p): delattr(bpy.types.PoseBone, p)
+
+    # 4. [추가] 오브젝트 속성 삭제
+    if hasattr(bpy.types.Object, "wiggle_layers"): delattr(bpy.types.Object, "wiggle_layers")
+    if hasattr(bpy.types.Object, "wiggle_layer_index"): delattr(bpy.types.Object, "wiggle_layer_index")

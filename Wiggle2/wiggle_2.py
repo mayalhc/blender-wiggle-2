@@ -732,79 +732,78 @@ def wiggle_post(scene, dg):
     w = scene.wiggle
     cf = scene.frame_current
     
-    # 1. 실행 조건 체크
+    if w.lastframe == cf and not w.reset: return
+    if bpy.context.screen and not bpy.context.screen.is_animation_playing:
+        if w.lastframe == cf: return
     if (w.lastframe == cf) and not w.reset and cf > scene.frame_start: return
     if w.reset or not scene.wiggle_enable or w.is_rendering: return
 
     lastframe = w.lastframe
     
-    # 2. [Auto Loop 핵심] 리셋 및 루핑 로직
+    # 2. [리셋 로직] - 전체 본 순회 대신 위글 리스트 본들만 정확히 타겟팅
     if (cf <= scene.frame_start) or (cf < lastframe):
-        use_loop = getattr(scene, "wiggle_use_loop", False)
         for wo in w.list:
             ob = scene.objects.get(wo.name)
             if not ob: continue
+            if ob.animation_data: ob.update_tag()
+            
             for wb in wo.list:
                 b = ob.pose.bones.get(wb.name)
                 if not b: continue
                 bw = b.wiggle
-                if not use_loop:
-                    m = ob.matrix_world @ b.matrix
-                    pos = m.to_translation()
-                    bw.position = bw.position_last = pos.copy()
-                    bw.velocity = Vector((0,0,0))
-                update_matrix(b, True)
+                b.location = (0, 0, 0)
+                if b.rotation_mode == 'QUATERNION': b.rotation_quaternion = (1, 0, 0, 0)
+                else: b.rotation_euler = (0, 0, 0)
+                b.scale = (1, 1, 1)
+
+                m = ob.matrix_world @ b.matrix
+                pos = m.to_translation()
+                bw.position = pos.copy()
+                bw.position_last = pos.copy()
+                bw.velocity = Vector((0, 0, 0))
+                if hasattr(bw, 'q'): bw.q = Quaternion((1, 0, 0, 0))
+
+            # [수정] 전체 본 대신 리스트에 있는 본들만 업데이트하여 충돌 방지
+            for wb in wo.list:
+                b = ob.pose.bones.get(wb.name)
+                if b: update_matrix(b, True)
+                
         w.lastframe = cf
         w.reset = False
         return
 
-    # 3. 시간 계산
-    frames_elapsed = cf - lastframe if cf >= lastframe else 1
-    fe = 1 if (frames_elapsed > 4 or w.is_preroll) else frames_elapsed
-    w.dt = (1.0 / max(1.0, scene.render.fps)) * fe
+    # 3. 시간 계산 (원본 수치 유지: fe를 곱하지 않음)
+    w.dt = (1.0 / max(1.0, scene.render.fps))
     w.lastframe = cf
-
-    # --- [3번 신규 로직: Safety Guard 속도 감지] ---
-    # per-armature로 정확하게 계산 (이전 코드에서는 w.delta_move가 없어서 항상 0이었음)
 
     # 4. 메인 루프
     for wo in w.list:
         ob = scene.objects.get(wo.name)
         if not ob or ob.wiggle_mute: continue
 
-        # ====================== Safety Boost 계산 (아마추어 개별) ======================
+        # Safety Boost (아마추어 개별 계산 유지)
         safety_boost = 0.0
         if getattr(scene, "wiggle_adaptive_damping", False):
-            if not hasattr(w, "last_ob_pos"):
-                w.last_ob_pos = {}
-
+            if not hasattr(w, "last_ob_pos"): w.last_ob_pos = {}
             current_pos = ob.matrix_world.translation.copy()
             last_pos = w.last_ob_pos.get(ob.name, current_pos)
-
             delta_move = current_pos - last_pos
             obj_speed = delta_move.length / w.dt if w.dt > 0 else 0
-
-            threshold = 5.0                                      # 빠른 움직임 감지 기준 (필요시 조정)
-            sensitivity = getattr(scene, "wiggle_safety_threshold", 10.0)  # ← UI의 Sensitivity 값
-
+            threshold = 5.0
+            sensitivity = getattr(scene, "wiggle_safety_threshold", 10.0)
             if obj_speed > threshold:
-                excess = obj_speed - threshold
-                safety_boost = excess * sensitivity
-                # safety_boost = excess * (sensitivity * 0.4)      # Sensitivity 10.0 기준으로 *4.0 강도
-
+                safety_boost = (obj_speed - threshold) * sensitivity
             w.last_ob_pos[ob.name] = current_pos
 
-        bones = [ob.pose.bones.get(wb.name) for wb in wo.list 
-                 if ob.pose.bones.get(wb.name) and not ob.pose.bones.get(wb.name).wiggle_mute]
-        
-        active_bones = [b for b in bones if getattr(b, "wiggle_influence", 1.0) > 0.0]
+        active_bones = [ob.pose.bones.get(wb.name) for wb in wo.list 
+                        if ob.pose.bones.get(wb.name) and not ob.pose.bones.get(wb.name).wiggle_mute]
+        active_bones = [b for b in active_bones if getattr(b, "wiggle_influence", 1.0) > 0.0]
         if not active_bones: continue
 
         orig_rots = {b.name: b.rotation_quaternion.copy() if b.rotation_mode == 'QUATERNION' 
                      else b.rotation_euler.to_quaternion() for b in active_bones}
 
         for b in active_bones:
-            # [Safety Guard 반영]
             b.wiggle.adaptive_damp_mod = safety_boost 
             move(b, dg)
             
@@ -821,10 +820,10 @@ def wiggle_post(scene, dg):
                 b.rotation_quaternion = anim_q.slerp(sim_q, inf)
                 update_matrix(b, True)
 
-        # 5. 속도 업데이트
+        # 5. 속도 업데이트 (원본 수치 유지: fe로 나누지 않음)
         for b in active_bones:
             bw = b.wiggle
-            bw.velocity = (bw.position - bw.position_last) / fe
+            bw.velocity = (bw.position - bw.position_last)
             bw.position_last = bw.position.copy()
         
         ob.update_tag()
@@ -995,107 +994,113 @@ class WiggleSelect(bpy.types.Operator):
 
     
 class WiggleBake(bpy.types.Operator):
-    """Bake this object's visible wiggle bones to keyframes"""
+    """Bake this object's visible wiggle bones to keyframes with Seamless Loop"""
     bl_idname = "wiggle.bake"
     bl_label = "Bake Wiggle"
     
     @classmethod
     def poll(cls, context):
-        return context.object
+        return context.object and context.object.type == 'ARMATURE'
 
     def execute(self, context):
-        # 1. Check if the active object is an Armature
+        # 1. 초기 설정
         obj = context.active_object
-        if not obj or obj.type != 'ARMATURE':
-            self.report({'WARNING'}, "Please select an Armature object first")
+        scene = context.scene
+        wiggle_props = scene.wiggle
+        
+        start_frame = scene.frame_start
+        end_frame = scene.frame_end
+        original_frame = scene.frame_current
+        duration = end_frame - start_frame
+        # 루프 보정 구간 (마지막 20%)
+        blend_frames = int(duration * 0.2) 
+
+        bake_bones = [
+            b for b in obj.pose.bones 
+            if (getattr(b, "wiggle_head", False) or getattr(b, "wiggle_tail", False)) 
+            and not getattr(b, "wiggle_mute", False)
+        ]
+
+        if not bake_bones:
+            self.report({'WARNING'}, "No bones to bake.")
             return {'CANCELLED'}
 
-        # 2. Ensure we are in Pose Mode
         if obj.mode != 'POSE':
-            try:
-                bpy.ops.object.mode_set(mode='POSE')
-            except Exception as e:
-                self.report({'ERROR'}, f"Failed to enter Pose Mode: {e}")
-                return {'CANCELLED'}
+            bpy.ops.object.mode_set(mode='POSE')
 
-        # 🔥 핵심 수정 시작: 첫번째·두번째 본이 수평(straight) 되는 문제 완전 해결
-        #     → bake 전에 반드시 frame_start로 이동 + 정확한 rest pose 강제
-        scene = context.scene
-        wiggle = scene.wiggle
+        if not obj.animation_data:
+            obj.animation_data_create()
 
-        # 현재 프레임을 bake 시작 프레임으로 강제 이동 (pose matrix 업데이트 보장)
-        original_frame = scene.frame_current
-        scene.frame_set(scene.frame_start)
-        bpy.context.view_layer.update()   # pose matrix 완전 업데이트
-
-        def push_nla():
-            if wiggle.bake_overwrite or not wiggle.bake_nla:
-                return
-            anim_data = obj.animation_data
-            if not anim_data or not anim_data.action:
-                return
-            action = anim_data.action
-            try:
-                track = anim_data.nla_tracks.new()
-                track.name = action.name
-                track.strips.new(action.name, int(action.frame_range[0]), action)
-                anim_data.action = None
-            except Exception as e:
-                print(f"NLA Push Warning: {e}")
-
-        # 3. NLA push + reset
-        push_nla()
-        bpy.ops.wiggle.reset()          # ← 우리가 수정한 reset_bone 호출
-
-        # 4. wiggle bone만 정확히 선택 (기존 wiggle_enable은 잘못된 프로퍼티)
-        for b in obj.pose.bones:
-            if (getattr(b, "wiggle_head", False) or getattr(b, "wiggle_tail", False)) and \
-               not getattr(b, "wiggle_mute", False):
-                b.select = True
-            else:
-                b.select = False
-
-        # 5. 두 번째 reset (선택 후 다시 정확한 rest pose 강제)
-        bpy.ops.wiggle.reset()
-
-        # 6. Preroll (기존 로직 유지하되 frame_start에서 정확히 시작)
-        duration = scene.frame_end - scene.frame_start
-        preroll = scene.wiggle.preroll
+        if not wiggle_props.bake_overwrite:
+            new_action = bpy.data.actions.new(name="WiggleAction")
+            obj.animation_data.action = new_action
+        
+        # 2. Preroll 안정화
         scene.wiggle.is_preroll = True
-
-        while preroll >= 0:
-            scene.frame_set(scene.frame_start)   # 매번 frame_start로 강제 (안정화)
-            preroll -= 1
-
+        preroll_start = start_frame - max(1, wiggle_props.preroll)
+        for f in range(preroll_start, start_frame):
+            scene.frame_set(f)
+            context.view_layer.update()
         scene.wiggle.is_preroll = False
 
-        # 7. 실제 베이크 (visual_keying + only_selected)
-        bpy.ops.nla.bake(
-            frame_start=scene.frame_start,
-            frame_end=scene.frame_end,
-            only_selected=True,
-            visual_keying=True,
-            use_current_action=scene.wiggle.bake_overwrite,
-            bake_types={'POSE'}
-        )
+        # 3. 메인 베이크 루프
+        for f in range(start_frame, end_frame + 1):
+            scene.frame_set(f)
+            context.view_layer.update()
 
-        # 8. 정리
-        scene.wiggle.is_preroll = False
+            for pbone in bake_bones:
+                pbone.keyframe_insert(data_path="location", group=pbone.name)
+                if pbone.rotation_mode == 'QUATERNION':
+                    pbone.keyframe_insert(data_path="rotation_quaternion", group=pbone.name)
+                elif pbone.rotation_mode == 'AXIS_ANGLE':
+                    pbone.keyframe_insert(data_path="rotation_axis_angle", group=pbone.name)
+                else:
+                    pbone.keyframe_insert(data_path="rotation_euler", group=pbone.name)
+                pbone.keyframe_insert(data_path="scale", group=pbone.name)
+
+        # 4. [핵심] Seamless Loop 보정 (AttributeError 수정 포함)
+        if obj.animation_data and obj.animation_data.action:
+            action = obj.animation_data.action
+            bone_names = {b.name for b in bake_bones}
+            
+            # Blender 4.0+ .curves / 하위 버전 .fcurves 호환 처리
+            curves = getattr(action, "curves", getattr(action, "fcurves", []))
+            
+            for fc in curves:
+                if any(f'["{name}"]' in fc.data_path for name in bone_names):
+                    # 시작 프레임 값 캡처
+                    start_val = fc.evaluate(start_frame)
+                    
+                    # 루프 블렌딩 실행
+                    if blend_frames > 0:
+                        for f in range(end_frame - blend_frames, end_frame + 1):
+                            t = (f - (end_frame - blend_frames)) / blend_frames
+                            current_val = fc.evaluate(f)
+                            # 끝값을 시작값으로 서서히 보간
+                            blended_val = current_val * (1.0 - t) + start_val * t
+                            fc.keyframe_points.insert(f, blended_val, options={'FAST'})
+
+                    # 핸들 정리
+                    for kp in fc.keyframe_points:
+                        kp.interpolation = 'BEZIER'
+                        kp.handle_left_type = 'AUTO'
+                        kp.handle_right_type = 'AUTO'
+                    fc.update()
+
+        # 5. 마무리 및 복구
         obj.wiggle_freeze = True
-        if not scene.wiggle.bake_overwrite and obj.animation_data and obj.animation_data.action:
-            obj.animation_data.action.name = 'WiggleAction'
-
-        # 원래 프레임으로 복구 (사용자 편의)
         scene.frame_set(original_frame)
-
+        
+        self.report({'INFO'}, f"Bake Complete with Seamless Loop: {start_frame} ~ {end_frame}")
         return {'FINISHED'}
+
 # START OF REVISION #
 
 class WiggleToggleBBox(bpy.types.Operator):
     bl_idname = "wiggle.toggle_bbox"
     bl_label = "Add/Remove Visual Guide"
     bl_options = {'REGISTER', 'UNDO'}
-
+    bl_description = "Select a mesh to use as a visual guide"
     @staticmethod
     def update_mesh_shape(pb, context):
         name = f"WGuide_{pb.name}"
@@ -1329,6 +1334,7 @@ class WiggleReset(bpy.types.Operator):
     bl_idname = "wiggle.reset"
     bl_label = "Hard Reset Physics & Cache"
     bl_options = {'REGISTER', 'UNDO'}
+    bl_description = "Clear all simulation data and actions. This cannot be undone"
     def execute(self, context):
         arm = context.object
         if not arm or arm.type != 'ARMATURE': return {'CANCELLED'}

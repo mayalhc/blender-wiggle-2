@@ -2,6 +2,7 @@ import bpy
 from . import wiggle_2 
 from . import ui_panel 
 from . import physics_logic 
+from . import wiggle_layers  # [신규 추가] 레이어 시스템 모듈
 
 # Load callback functions for Stiff and Damp from the logic file
 from .physics_logic import wiggle_taper_callback, wiggle_damp_callback
@@ -59,8 +60,7 @@ def register():
             default=False
         )
 
-    # 4. Register existing modules - [에러 방지 강화]
-    # 하나가 에러나도 나머지는 등록되도록 try-except 처리
+    # 4. Register existing modules - [에러 방지 강화 및 레이어 추가]
     try:
         physics_logic.register() 
     except:
@@ -69,7 +69,6 @@ def register():
     try:
         wiggle_2.register() 
     except ValueError:
-        # 'already registered' 에러 발생 시 무시하고 진행
         pass
 
     try:
@@ -77,18 +76,35 @@ def register():
     except ValueError:
         pass
 
-def unregister():
-    # 1. Unregister existing modules
-    try: ui_panel.unregister()
-    except: pass
-    
-    try: wiggle_2.unregister()
-    except: pass
-    
-    try: physics_logic.unregister()
-    except: pass
+    # [신규 추가] 레이어 시스템 모듈 등록
+    try:
+        wiggle_layers.register()
+    except ValueError:
+        pass
 
-    # 2. Remove registered properties for memory cleanup
+def unregister():
+    # 1. Unregister existing modules (역순 등록 해제 권장)
+    try:
+        wiggle_layers.unregister() # [신규 추가]
+    except:
+        pass
+
+    try:
+        ui_panel.unregister()
+    except:
+        pass
+    
+    try:
+        wiggle_2.unregister()
+    except:
+        pass
+    
+    try:
+        physics_logic.unregister()
+    except:
+        pass
+
+    # 2. Remove registered properties for memory cleanup - [원본 개별 삭제 방식 유지]
     if hasattr(bpy.types.PoseBone, "wiggle_stiff_use_dist"):
         del bpy.types.PoseBone.wiggle_stiff_use_dist
     if hasattr(bpy.types.PoseBone, "wiggle_damp_use_dist"):

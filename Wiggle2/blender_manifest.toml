@@ -1,10 +1,10 @@
 schema_version = "1.0.0"
 
 id = "wiggle_2"
-version = "2.1.8"
+version = "2.2.0"
 name = "Wiggle 2: RTX Edition"
 
-tagline = "Immortal RTX Engine: Optimized for GroomForge Hair Physics"
+tagline = " Instant Procedural Bone Physics for Any Rig"
 maintainer = "Chamiseul"
 type = "add-on"
 
@@ -14,11 +14,11 @@ license = ["SPDX:GPL-3.0-or-later"]
 
 [authors]
 name = "shteeve3d, Chamiseul"
-tags = ["Animation", "Rigging", "Physics", "Hair"]
+tags = ["Animation", "Rigging", "Physics"]
 
 [links]
 
-homepage = "https://github.com/mayalhc/blender-wiggle-2"
+homepage = "https://mayalhc.github.io/Wiggle2-RTX"
 
 repository = "https://github.com/mayalhc/blender-wiggle-2"
 "Original Project (shteeve3d)" = "https://github.com/shteeve3d/blender-wiggle-2"
