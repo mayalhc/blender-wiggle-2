@@ -6,220 +6,263 @@ _sync_in_progress = False
 
 # --- NLA INFLUENCE CLEANUP (Blender NLA 핵심 해결책) ---
 def use_animated_influence(strip):
-    """NLA strip의 influence를 Python에서 강제로 static 값으로 만들기
-    - 첫 번째 키프레임(기본값)이 존재하면 제거
-    - use_animated_influence = True로 설정하여 Blender가 Python influence를 존중하게 함"""
+    """NLA strip의 influence를 Python에서 강제로 static 값으로 만들기"""
     if strip.use_animated_influence:
         return
-    
-    # 기존 animated influence 활성화
+        
     strip.use_animated_influence = True
     
-    # 첫 번째 FCurve(인플루언스 커브)에서 키프레임 제거
-    if strip.fcurves and len(strip.fcurves) > 0:
-        fcu = strip.fcurves[0]  # influence는 항상 첫 번째 FCurve
-        if fcu.keyframe_points:
-            # 첫 번째 키프레임만 제거 (Blender가 자동으로 생성한 기본 키)
-            keyframes = fcu.keyframe_points
-            if len(keyframes) > 0:
-                keyframe = keyframes[0]
-                keyframes.remove(keyframe)
-    
+    # 💡 [수정 완료] NlaStrip에는 fcurves가 직접 존재하지 않으므로 
+    # 블렌더 애니메이션 데이터 내 주소 ID 및 액션 F-커브 구조를 안전하게 역추적하여 초기화합니다.
+    if strip.action and hasattr(strip.action, "fcurves"):
+        for fcu in strip.action.fcurves:
+            if "influence" in fcu.data_path:
+                strip.action.fcurves.remove(fcu)
+                
     # static influence 강제 적용
     strip.influence = 1.0
 
-
 # --- CORE FUNCTIONS ---
-
 @persistent
 def wiggle_frame_change_handler(scene):
     """매 프레임마다 Layer Weight + Sim Mix 적용 (recursion 방지)"""
     global _sync_in_progress
     if _sync_in_progress:
         return
+        
     try:
         _sync_in_progress = True
         obj = bpy.context.object
         if obj and obj.type == 'ARMATURE' and hasattr(obj, "wiggle_layers") and obj.animation_data:
             if 0 <= getattr(obj, "wiggle_layer_index", -1) < len(obj.wiggle_layers):
                 sync_combined_result(obj)
-    except:
+    except Exception as e:
         pass
     finally:
         _sync_in_progress = False
-
 
 def sync_combined_result(obj):
     """Layer Weight(NLA 블렌드) + Sim Mix(Physics) 완전 분리"""
     if not obj or not obj.animation_data:
         return
-
+        
     layers = obj.wiggle_layers
     idx = obj.wiggle_layer_index
     active_layer = layers[idx] if 0 <= idx < len(layers) else None
+    existing_action = None
+    
+    # NLA 트랙 안전 조회
+    nla_tracks = getattr(obj.animation_data, "nla_tracks", [])
+    for track in nla_tracks:
+        if track.name != "WGL_Base" and not track.name.startswith("WGL_Trk_"):
+            first_strip = next((s for s in track.strips), None)
+            if first_strip and first_strip.action:
+                existing_action = first_strip.action
+                break
+                
+    base_track = next((t for t in nla_tracks if t.name.startswith("WGL_Base")), None)
+    has_strips = any(True for _ in base_track.strips) if base_track else False
+    target_action = None
+    
+    if not base_track or not has_strips:
+        if existing_action:
+            target_action = existing_action
+        elif obj.animation_data.action and not obj.animation_data.action.name.startswith("Act_Sim_"):
+            target_action = obj.animation_data.action
+        else:
+            base_layer = next((l for l in layers if l.type == 'BASE'), None)
+            if base_layer and hasattr(base_layer, "action_name") and base_layer.action_name:
+                target_action = bpy.data.actions.get(base_layer.action_name)
+                
+        if not target_action and base_track:
+            first_strip = next((s for s in base_track.strips), None)
+            if first_strip and first_strip.action:
+                target_action = first_strip.action
+                
+    if target_action:
+        if not base_track:
+            base_track = obj.animation_data.nla_tracks.new()
+            base_track.name = "WGL_Base"
+        else:
+            base_track.name = "WGL_Base"
+            
+        base_track.lock = False
+        base_track.mute = False
+        
+        if not has_strips:
+            # 💡 [수정 완료] context 프레임 참조 오류 방지 가드 가미
+            start_fr = bpy.context.scene.frame_start if bpy.context.scene else 1.0
+            strip = base_track.strips.new(target_action.name, int(start_fr), target_action)
+            strip.blend_type = 'REPLACE'
+            strip.extrapolation = 'HOLD'
+            strip.influence = 1.0
+            use_animated_influence(strip)
+            
+        if existing_action:
+            obj.animation_data.action = existing_action
+        else:
+            if obj.animation_data.action == target_action:
+                obj.animation_data.action = None
+                
+        all_base_tracks = [t for t in obj.animation_data.nla_tracks if t.name.startswith("WGL_Base")]
+        if len(all_base_tracks) > 1:
+            for extra_track in all_base_tracks[1:]:
+                obj.animation_data.nla_tracks.remove(extra_track)
+                
+        # 💡 [수정 완료] 존재하지 않는 속성인 is_tweakmode를 제거하고 use_tweak_mode 규칙으로 정상 일치화했습니다.
+        if hasattr(obj.animation_data, "use_tweak_mode") and obj.animation_data.use_tweak_mode:
+            obj.animation_data.use_tweak_mode = False
+            
+        if existing_action and existing_action.frame_range:
+            act_start, act_end = existing_action.frame_range
+            if bpy.context.scene:
+                bpy.context.scene.frame_start = int(act_start)
+                bpy.context.scene.frame_end = int(act_end)
+                
+        if base_track:
+            user_tracks = [t for t in obj.animation_data.nla_tracks if t.name != "WGL_Base" and not t.name.startswith("WGL_Trk_")]
+            if user_tracks:
+                for strip in base_track.strips:
+                    strip.use_auto_blend = False
 
-    # 1. BASE NLA 트랙 자동 생성
-    base_layer = next((l for l in layers if l.type == 'BASE'), None)
-    if base_layer and base_layer.action_name:
-        target_action = bpy.data.actions.get(base_layer.action_name)
-        if target_action:
-            has_base_track = any(
-                any(s.action == target_action for s in track.strips)
-                for track in obj.animation_data.nla_tracks
-            )
-            if not has_base_track:
-                track = obj.animation_data.nla_tracks.new()
-                track.name = "WGL_Base"
-                strip = track.strips.new(target_action.name, int(bpy.context.scene.frame_start), target_action)
-                strip.blend_type = 'REPLACE'
-                strip.extrapolation = 'HOLD'
-                strip.influence = 1.0
-                use_animated_influence(strip)   # ← 핵심: influence cleanup
+    # === [최적화 수정] 매 프레임 탐색 성능 향상을 위해 NLA 트랙을 액션 이름 기준으로 사전 매핑합니다.
+    nla_tracks = getattr(obj.animation_data, "nla_tracks", [])
+    action_to_tracks = {}
+    for track in nla_tracks:
+        for strip in track.strips:
+            if strip.action:
+                action_to_tracks.setdefault(strip.action.name, []).append(track)
 
-    # 2. 모든 레이어 기본 상태
+    # 2. 모든 레이어 기본 상태 설정
     for layer in layers:
         if not layer.action_name:
             continue
         target_action = bpy.data.actions.get(layer.action_name)
         if not target_action:
             continue
-        for track in obj.animation_data.nla_tracks:
-            if any(s.action == target_action for s in track.strips):
-                track.mute = layer.mute
-                for strip in track.strips:
-                    strip.blend_type = 'REPLACE' if layer.type == 'BASE' else 'COMBINE'
-                    strip.extrapolation = 'HOLD'
+            
+        # 사전(Dict) 캐시를 활용해 중복 루프를 제거하고 다이렉트로 트랙을 제어합니다.
+        matched_tracks = action_to_tracks.get(target_action.name, [])
+        for track in matched_tracks:
+            track.mute = layer.mute
+            for strip in track.strips:
+                strip.blend_type = 'REPLACE' if layer.type == 'BASE' else 'COMBINE'
+                strip.extrapolation = 'HOLD'
 
-    # 3. Layer Weight 블렌드 (NLA 전용)
+    # 3. Layer Weight 블렌드 (NLA 전용 크로스페이드)
     if active_layer:
         if active_layer.type == 'BASE':
-            # Base 선택 → Sim 완전 mute
+            # Base 레이어 선택 상태 → 모든 Sim 레이어를 완전 음소거(Mute) 처리
             for layer in layers:
                 if layer.type == 'SIM' and layer.action_name:
-                    target_action = bpy.data.actions.get(layer.action_name)
-                    if target_action:
-                        for track in obj.animation_data.nla_tracks:
-                            if any(s.action == target_action for s in track.strips):
-                                track.mute = True
-            # Base ON
-            target_action = bpy.data.actions.get(active_layer.action_name)
-            if target_action:
-                for track in obj.animation_data.nla_tracks:
-                    if any(s.action == target_action for s in track.strips):
+                    t_act = bpy.data.actions.get(layer.action_name)
+                    if t_act:
+                        for track in action_to_tracks.get(t_act.name, []):
+                            track.mute = True
+                            
+            # 선택된 Base 레이어 활성화
+            if active_layer.action_name:
+                base_act = bpy.data.actions.get(active_layer.action_name)
+                if base_act:
+                    for track in action_to_tracks.get(base_act.name, []):
                         track.mute = False
                         for strip in track.strips:
                             strip.influence = 1.0
-                            use_animated_influence(strip)   # ← 핵심 cleanup
-
+                            use_animated_influence(strip) # 인플루언스 락 가드
         else:
-            # Sim 선택 → Layer Weight로 Base/Sim cross-fade
+            # Sim 레이어 선택 상태 → Layer Weight 값에 맞춰 Base와 Sim 간의 가중치 교차 감쇠(Cross-fade)
             weight = active_layer.influence
-            base_influence = 1.0 - weight
-
-            # Base
+            base_influence = max(0.0, min(1.0, 1.0 - weight)) # 안전한 범위 클램핑
+            
+            # Base 레이어 가중치 적용
             base_layer = next((l for l in layers if l.type == 'BASE'), None)
             if base_layer and base_layer.action_name:
-                target_action = bpy.data.actions.get(base_layer.action_name)
-                if target_action:
-                    for track in obj.animation_data.nla_tracks:
-                        if any(s.action == target_action for s in track.strips):
-                            track.mute = False
-                            for strip in track.strips:
-                                strip.influence = base_influence
-                                use_animated_influence(strip)   # ← 핵심 cleanup
-
-            # 현재 Sim Layer
-            target_action = bpy.data.actions.get(active_layer.action_name)
-            if target_action:
-                for track in obj.animation_data.nla_tracks:
-                    if any(s.action == target_action for s in track.strips):
+                base_act = bpy.data.actions.get(base_layer.action_name)
+                if base_act:
+                    for track in action_to_tracks.get(base_act.name, []):
+                        track.mute = False
+                        for strip in track.strips:
+                            strip.influence = base_influence
+                            use_animated_influence(strip)
+                            
+            # 현재 선택된 대상 Sim 레이어 가중치 적용
+            if active_layer.action_name:
+                sim_act = bpy.data.actions.get(active_layer.action_name)
+                if sim_act:
+                    for track in action_to_tracks.get(sim_act.name, []):
                         if weight <= 0.0001:
                             track.mute = True
                         else:
                             track.mute = False
                             for strip in track.strips:
                                 strip.influence = weight
-                                use_animated_influence(strip)   # ← 핵심 cleanup
-
-            # 다른 Sim OFF
+                                use_animated_influence(strip)
+                                
+            # 선택되지 않은 다른 나머지 모든 Sim 레이어들은 일괄 OFF(음소거)
             for layer in layers:
                 if layer.type == 'SIM' and layer != active_layer and layer.action_name:
-                    target_action = bpy.data.actions.get(layer.action_name)
-                    if target_action:
-                        for track in obj.animation_data.nla_tracks:
-                            if any(s.action == target_action for s in track.strips):
-                                track.mute = True
+                    other_act = bpy.data.actions.get(layer.action_name)
+                    if other_act:
+                        for track in action_to_tracks.get(other_act.name, []):
+                            track.mute = True
 
-    # 4. Sim Mix (Physics) — 완전 독립
+# 4. Sim Mix (Physics) — 완전 독립 제어
     physics_strength = 0.0
     if active_layer and active_layer.type == 'SIM':
-        physics_strength = active_layer.sim_mix
-
+        physics_strength = active_layer.sim_mix        
     for pb in obj.pose.bones:
-        pb.wiggle_influence = physics_strength
-        if hasattr(pb, "wiggle_stiffness"):
-            pb.wiggle_stiffness = (1.0 - pb.wiggle_influence) * 80.0
+        pb.wiggle_influence = physics_strength        
+        if hasattr(pb, "wiggle_stiff"):
+            pb.wiggle_stiff = (1.0 - pb.wiggle_influence) * 80.0
+    if obj.id_data:
+        obj.id_data.update_tag()
 
-    # viewport 안전 업데이트
-    try:
-        bpy.context.view_layer.update()
-    except:
-        pass
 
 
 def update_layer_params(self, context):
-    """슬라이더 변경 시 즉시 sync"""
+    """슬라이더 변경 시 즉시 sync 및 3D 뷰포트 안전 갱신"""
     obj = context.object
     if obj:
         sync_combined_result(obj)
-    if context.area:
-        context.area.tag_redraw()
-    # Layer Weight 슬라이더 변경 시 redraw
-    try:
-        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
-    except:
-        pass
-
+    if context.screen:
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
 
 def update_layer_selection(self, context):
     obj = context.object
     if not obj or not obj.animation_data:
         return
-
-    idx = obj.wiggle_layer_index
-    if 0 <= idx < len(obj.wiggle_layers):
+        
+    idx = getattr(obj, "wiggle_layer_index", -1)
+    if hasattr(obj, "wiggle_layers") and 0 <= idx < len(obj.wiggle_layers):
         active_layer = obj.wiggle_layers[idx]
         target_action = bpy.data.actions.get(active_layer.action_name)
         if target_action:
             obj.animation_data.action = target_action
-
-    sync_combined_result(obj)
-
-
-# --- DATA STRUCTURE ---
+        sync_combined_result(obj)
 
 class WiggleSimLayer(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Layer Name", default="New Layer")
     action_name: bpy.props.StringProperty(name="Action Data")
     type: bpy.props.EnumProperty(
         items=[('BASE', "Base (Anim)", ""), ('SIM', "Simulation", "")],
-        name="Type", default='SIM'
+        name="Type",
+        default='SIM'
     )
     influence: bpy.props.FloatProperty(name="Weight", default=1.0, min=0.0, max=1.0, update=update_layer_params)
     sim_mix: bpy.props.FloatProperty(name="Sim Mix", default=1.0, min=0.0, max=1.0, update=update_layer_params)
     mute: bpy.props.BoolProperty(name="Mute", default=False, update=update_layer_params)
 
-
 # --- UI LIST ---
-
 class WIGGLE_UL_SimMixLayers(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
         row = layout.row(align=True)
-        row.prop(item, "mute", text="", icon='CHECKBOX_HLT' if not item.mute else 'CHECKBOX_DEHLT', emboss=False)
+
+        row.prop(item, "mute", text="", icon='CHECKBOX_DEHLT' if item.mute else 'CHECKBOX_HLT', emboss=False)
         row.label(text="", icon='ANIM' if item.type == 'BASE' else 'PHYSICS')
         row.prop(item, "name", text="", emboss=False)
         row.label(text=f"{int(item.influence * 100)}%")
-
 
 # --- OPERATORS ---
 

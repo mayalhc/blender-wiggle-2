@@ -106,51 +106,34 @@ def build_list():
 
         
 def update_prop(self, context, prop):
-    # 1. 무한 루프 방지
     if context.scene.get("wiggle_updating"):
         return
-    
-    # 2. 속성값 미리 확보
+        
     val = getattr(self, prop)
     context.scene["wiggle_updating"] = True
     
     try:
         if isinstance(self, bpy.types.PoseBone):
-            selected_bones = context.selected_pose_bones
-            
-            # 3. 값 전파 루프 (최대한 가볍게)
+            selected_bones = getattr(context, "selected_pose_bones", []) or []
+
             for b in selected_bones:
                 if b != self:
-                    # 속도 향상을 위한 직접 대입 시도
                     if prop in b:
                         b[prop] = val
                     else:
                         setattr(b, prop, val)
 
-            # 4. 무거운 초기화 로직은 필요할 때만 실행
-            if prop in ['wiggle_head', 'wiggle_tail']:
-                # globals()에서 함수 존재 여부 확인 후 실행
+            if prop in ['wiggle_head', 'wiggle_tail', 'wiggle_enable', 'wiggle_mute']:
                 rb = globals().get('reset_bone')
                 if rb:
                     for b in selected_bones:
                         rb(b)
-
-        # 5. UI 및 리스트 갱신
-        if prop in ['wiggle_mute', 'wiggle_enable', 'wiggle_head', 'wiggle_tail']:
-            bl = globals().get('build_list')
-            if bl:
-                bl()
-
+                        
+                bl = globals().get('build_list')
+                if bl: 
+                    bl()
     finally:
-        # 6. 플래그 해제
         context.scene["wiggle_updating"] = False
-        
-        # 7. 핵심 최적화: 불필요한 Redraw 방지
-        ws = getattr(context.scene, "wiggle", None)
-        if ws and hasattr(ws, "is_rendering"):
-            if ws.is_rendering: # True일 때만 False로 바꿈
-                ws.is_rendering = False
-
 
 def get_parent(b):
     p = b.parent
@@ -206,7 +189,7 @@ def collide(b,dg,head=False):
         if wiggle_collider.name in bpy.context.scene.objects:
             colliders = [wiggle_collider]
     if collider_type == 'Collection' and wiggle_collection:
-        if wiggle_collection in bpy.context.scene.collection.children_recursive:
+        if wiggle_collection and wiggle_collection.name in bpy.data.collections:
             colliders = [ob for ob in wiggle_collection.objects if ob.type == 'MESH']
     col = False
     for collider in colliders:
@@ -283,12 +266,13 @@ def update_matrix(b, last=False):
     else:
         par = b.parent
         if par:
-            dist = (b.id_data.matrix_world @ par.matrix @ relative_matrix(par.matrix, b.matrix).translation - b.wiggle.position).length
+            dist = ((b.id_data.matrix_world @ par.matrix @ relative_matrix(par.matrix, b.matrix)).translation - b.wiggle.position).length
             if p:
                 dist = (p.wiggle.matrix @ relative_matrix(p.matrix, b.matrix).translation - b.wiggle.position).length
             sy = dist / l_world if l_world > 0.0001 else 1.0
         else:
-            dist = (b.id_data.matrix_world @ b.matrix.translation - b.wiggle.position).length
+            # 변경 코드:
+            dist = ((b.id_data.matrix_world @ b.matrix).to_translation() - b.wiggle.position).length
             sy = dist / l_world if l_world > 0.0001 else 1.0
     
     if b.wiggle_head and not b.bone.use_connect:
@@ -348,27 +332,25 @@ def update_visual_guide(self, context):
         length = self.bone.length
         t = self.wiggle_radius * 2 if self.wiggle_radius > 0.0005 else 0.001
         
-        # 이전 계산된 오프셋을 가져옴 (없으면 현재 값으로 초기화)
         old_offset = guide_obj.get("last_offset", length / t)
         new_offset = length / t
-        
-        # 두께(스케일)를 먼저 업데이트
         guide_obj.scale = (t, t, t)
         
-        is_capsule = len(guide_obj.data.vertices) > 100
-        for v in guide_obj.data.vertices:
+        # 메쉬 데이터를 안전하게 업데이트하기 위한 블렌더 표준 방식
+        mesh = guide_obj.data
+        is_capsule = len(mesh.vertices) > 100
+        
+        for v in mesh.vertices:
             if is_capsule:
-                # [중요] 상단 반구 정점들만 골라서 위치 보정
-                # 이전 오프셋을 빼서 원복(0.5 지점)시킨 뒤, 새 오프셋을 더함
-                if v.co.z > 0.6: 
+                if v.co.z > 0.6:
                     v.co.z = (v.co.z - old_offset) + new_offset
-            else: # BOX, CYLINDER
-                # 박스나 실린더는 천장 평면만 새 오프셋으로 고정
+            else:
                 if v.co.z > 0.1:
                     v.co.z = new_offset
-        
-        # 다음 업데이트를 위해 현재 오프셋 저장
+                    
         guide_obj["last_offset"] = new_offset
+        mesh.update()  # 💡 블렌더에게 메쉬가 변경되었음을 알려 화면을 갱신합니다.
+
 # END OF REVISION #
 
 # START OF REVISION #
@@ -382,25 +364,30 @@ def apply_angle_limits(b, h_pos, q_basis, rest_dir, world_rest_length):
     if curr_vec.length < 1e-6:
         return h_pos + rest_dir * world_rest_length
 
-    # =========================
-    # 1. 통합 리미트 (Cone) — 가장 먼저 적용 (자연스러운 원형 움직임)
-    # =========================
     wiggle_angle_limit = getattr(b, "wiggle_angle_limit", 180)
     if wiggle_angle_limit < 179.5:
         limit_rad = radians(wiggle_angle_limit)
-
+        
+        # 1. 안전하게 두 벡터를 모두 정규화합니다.
+        rest_dir_norm = rest_dir.normalized()
         curr_dir = curr_vec.normalized()
-        dot = max(-1.0, min(1.0, rest_dir.dot(curr_dir)))
+        
+        # 2. 부동소수점 오차 방지 clamp
+        dot = max(-1.0, min(1.0, rest_dir_norm.dot(curr_dir)))
         angle = acos(dot)
-
+        
         if angle > limit_rad:
-            axis = rest_dir.cross(curr_dir)
+            axis = rest_dir_norm.cross(curr_dir)
+            
             if axis.length > 1e-6:
                 axis.normalize()
-                curr_dir = Quaternion(axis, limit_rad) @ rest_dir
+                curr_dir = Quaternion(axis, limit_rad) @ rest_dir_norm
             else:
-                curr_dir = rest_dir.copy()
 
+                ortho_axis = Vector((0, 1, 0)) if abs(rest_dir_norm.x) > 0.9 else Vector((1, 0, 0))
+                
+                axis = rest_dir_norm.cross(ortho_axis).normalized()
+                curr_dir = Quaternion(axis, limit_rad) @ rest_dir_norm
             curr_vec = curr_dir * world_rest_length
 
     # =========================
@@ -536,11 +523,9 @@ def move(b, dg):
 
 # START OF REVISION #
 def constrain(b, i, dg):
-    dt = bpy.context.scene.wiggle.dt
-    
+    dt = bpy.context.scene.wiggle.dt    
     def get_fac(mass1, mass2):
-        return 0.5 if mass1 == mass2 else mass1 / (mass1 + mass2)
-    
+        return 0.5 if mass1 == mass2 else mass1 / (mass1 + mass2)   
     def spring(target, position, stiff):
         s = target - position
         Fs = s * stiff / bpy.context.scene.wiggle.iterations
@@ -574,7 +559,6 @@ def constrain(b, i, dg):
                 b.wiggle.position_head += s * (1 - fac)
             else:
                 b.wiggle.position_head += s
-
             # [핵심 수정] 5.0 스케일 폭주 방지: 스케일을 무조건 (1,1,1)로 강제 고정
             loc, rot, _ = mat.decompose()
             mat = Matrix.LocRotScale(b.wiggle.position_head, rot, Vector((1.0, 1.0, 1.0)))
@@ -882,47 +866,52 @@ class WiggleCopy(bpy.types.Operator):
     def poll(cls,context):
         return context.mode in ['POSE'] and context.active_pose_bone and (len(context.selected_pose_bones)>1)
     
-    def execute(self,context):
+    def execute(self, context):
         b = context.active_pose_bone
-#        b.wiggle_enable = b.wiggle_enable
-        b.wiggle_mute = b.wiggle_mute
-        b.wiggle_head = b.wiggle_head
-        b.wiggle_tail = b.wiggle_tail
-        b.wiggle_head_mute = b.wiggle_head_mute
-        b.wiggle_tail_mute = b.wiggle_tail_mute
+        selected_bones = context.selected_pose_bones
         
-        b.wiggle_mass = b.wiggle_mass
-        b.wiggle_stiff = b.wiggle_stiff
-        b.wiggle_stretch = b.wiggle_stretch
-        b.wiggle_damp = b.wiggle_damp
-        b.wiggle_gravity = b.wiggle_gravity
-        b.wiggle_wind_ob = b.wiggle_wind_ob
-        b.wiggle_wind = b.wiggle_wind
-        b.wiggle_collider_type = b.wiggle_collider_type
-        b.wiggle_collider = b.wiggle_collider
-        b.wiggle_collider_collection = b.wiggle_collider_collection
-        b.wiggle_radius = b.wiggle_radius
-        b.wiggle_friction = b.wiggle_friction
-        b.wiggle_bounce = b.wiggle_bounce
-        b.wiggle_sticky = b.wiggle_sticky
-        b.wiggle_chain = b.wiggle_chain
-        
-        b.wiggle_mass_head = b.wiggle_mass_head
-        b.wiggle_stiff_head = b.wiggle_stiff_head
-        b.wiggle_stretch_head = b.wiggle_stretch_head
-        b.wiggle_damp_head = b.wiggle_damp_head
-        b.wiggle_gravity_head = b.wiggle_gravity_head
-        b.wiggle_wind_ob_head = b.wiggle_wind_ob_head
-        b.wiggle_wind_head = b.wiggle_wind_head
-        b.wiggle_collider_type_head = b.wiggle_collider_type_head
-        b.wiggle_collider_head = b.wiggle_collider_head
-        b.wiggle_collider_collection_head = b.wiggle_collider_collection_head
-        b.wiggle_radius_head = b.wiggle_radius_head
-        b.wiggle_friction_head = b.wiggle_friction_head
-        b.wiggle_bounce_head = b.wiggle_bounce_head
-        b.wiggle_sticky_head = b.wiggle_sticky_head
-        b.wiggle_chain_head = b.wiggle_chain_head
+        # 💡 [수정 완료] 선택된 다른 모든 본들에게 활성화된 본(b)의 세팅 값을 루프 돌며 복사합니다.
+        for sb in selected_bones:
+            if sb == b:
+                continue
+            sb.wiggle_mute = b.wiggle_mute
+            sb.wiggle_head = b.wiggle_head
+            sb.wiggle_tail = b.wiggle_tail
+            sb.wiggle_head_mute = b.wiggle_head_mute
+            sb.wiggle_tail_mute = b.wiggle_tail_mute
+            sb.wiggle_mass = b.wiggle_mass
+            sb.wiggle_stiff = b.wiggle_stiff
+            sb.wiggle_stretch = b.wiggle_stretch
+            sb.wiggle_damp = b.wiggle_damp
+            sb.wiggle_gravity = b.wiggle_gravity
+            sb.wiggle_wind_ob = b.wiggle_wind_ob
+            sb.wiggle_wind = b.wiggle_wind
+            sb.wiggle_collider_type = b.wiggle_collider_type
+            sb.wiggle_collider = b.wiggle_collider
+            sb.wiggle_collider_collection = b.wiggle_collider_collection
+            sb.wiggle_radius = b.wiggle_radius
+            sb.wiggle_friction = b.wiggle_friction
+            sb.wiggle_bounce = b.wiggle_bounce
+            sb.wiggle_sticky = b.wiggle_sticky
+            sb.wiggle_chain = b.wiggle_chain
+            sb.wiggle_mass_head = b.wiggle_mass_head
+            sb.wiggle_stiff_head = b.wiggle_stiff_head
+            sb.wiggle_stretch_head = b.wiggle_stretch_head
+            sb.wiggle_damp_head = b.wiggle_damp_head
+            sb.wiggle_gravity_head = b.wiggle_gravity_head
+            sb.wiggle_wind_ob_head = b.wiggle_wind_ob_head
+            sb.wiggle_wind_head = b.wiggle_wind_head
+            sb.wiggle_collider_type_head = b.wiggle_collider_type_head
+            sb.wiggle_collider_head = b.wiggle_collider_head
+            sb.wiggle_collider_collection_head = b.wiggle_collider_collection_head
+            sb.wiggle_radius_head = b.wiggle_radius_head
+            sb.wiggle_friction_head = b.wiggle_friction_head
+            sb.wiggle_bounce_head = b.wiggle_bounce_head
+            sb.wiggle_sticky_head = b.wiggle_sticky_head
+            sb.wiggle_chain_head = b.wiggle_chain_head
+            
         return {'FINISHED'}
+
 
 # START OF REVISION #
 class WiggleReset(bpy.types.Operator):
@@ -1128,7 +1117,7 @@ class WiggleToggleBBox(bpy.types.Operator):
     def execute(self, context):
         arm = context.object
         scene = context.scene
-        selected_bones = context.selected_pose_bones
+        selected_bones = getattr(context, "selected_pose_bones", []) or []
         if not selected_bones: return {'CANCELLED'}
 
         first_name = f"WGuide_{selected_bones[0].name}"
@@ -1175,18 +1164,23 @@ class WiggleToggleBBox(bpy.types.Operator):
         return {'FINISHED'}
     
 # END OF REVISION #
+#N START OF REVISION #
 class WigglePreset(bpy.types.Operator):
     bl_idname = "wiggle.preset"
     bl_label = "Physics Preset"
     bl_options = {'REGISTER', 'UNDO'}
-    type: bpy.props.StringProperty() 
+    
+    type: bpy.props.StringProperty()
 
     def execute(self, context):
-        b = context.active_pose_bone
+        # 💡 [치명적 버그 수정] 단일 active_pose_bone 대신, 드래그로 다중 선택된 모든 본들(selected_bones)을 가져옵니다.
+        selected_bones = getattr(context, "selected_pose_bones", []) or []
+        if not selected_bones:
+            self.report({'WARNING'}, "No pose bone selected")
+            return {'CANCELLED'}
+            
         scene = context.scene
-        if not b: return {'CANCELLED'}
         
-        # 1. 분배 로직 모듈 동적 로드 (익스텐션 경로 문제 해결)
         try:
             import importlib
             package_name = '.'.join(__name__.split('.')[:-1])
@@ -1195,56 +1189,58 @@ class WigglePreset(bpy.types.Operator):
         except Exception as e:
             self.report({'ERROR'}, f"Module Load Error: {e}")
             return {'CANCELLED'}
-
+            
         if not apply_func:
-            self.report({'ERROR'}, "physics_logic.py에서 apply_taper_to_chain 함수를 찾을 수 없습니다.")
+            self.report({'ERROR'}, "Cannot find the function 'apply_taper_to_chain'")
             return {'CANCELLED'}
-
-        # 2. 분배 모드(Use Dist) 활성화
-        b.wiggle_stiff_use_dist = True
-        b.wiggle_damp_use_dist = True
-        
-        # 3. 프리셋 타입에 따른 가변 범위 설정
-        if self.type == 'JELLY': 
+            
+        # 프리셋 종류별 수치 매칭 파싱
+        if self.type == 'JELLY':
             s_start, s_end = 20.0, 5.0
             d_start, d_end = 1.0, 0.1
-            b.wiggle_bounce, b.wiggle_gravity, b.wiggle_friction = 0.8, 0.5, 0.4
-        elif self.type == 'HAIR': 
+            gravity, friction, bounce = 0.5, 0.4, 0.8
+        elif self.type == 'HAIR':
             s_start, s_end = 50.0, 0.0
             d_start, d_end = 5.0, 0.0
-            b.wiggle_friction, b.wiggle_gravity, b.wiggle_bounce = 0.8, 1.0, 0.1
-        elif self.type == 'HEAVY': 
+            gravity, friction, bounce = 1.0, 0.8, 0.1
+        elif self.type == 'HEAVY':
             s_start, s_end = 40.0, 10.0
             d_start, d_end = 4.0, 0.5
-            b.wiggle_gravity, b.wiggle_friction = 2.5, 0.9
-        elif self.type == 'CLOTH': 
+            gravity, friction, bounce = 2.5, 0.9, 0.1
+        elif self.type == 'CLOTH':
             s_start, s_end = 15.0, 2.0
             d_start, d_end = 3.0, 0.5
-            b.wiggle_gravity, b.wiggle_friction = 0.8, 0.7
-        elif self.type == 'SPRING': 
+            gravity, friction, bounce = 0.8, 0.7, 0.1
+        elif self.type == 'SPRING':
             s_start, s_end = 60.0, 30.0
             d_start, d_end = 0.5, 0.1
-            b.wiggle_bounce, b.wiggle_gravity = 0.9, 0.3
-        elif self.type == 'ANTENNA': 
+            gravity, friction, bounce = 0.3, 0.5, 0.9
+        elif self.type == 'ANTENNA':
             s_start, s_end = 50.0, 20.0
             d_start, d_end = 0.8, 0.2
-            b.wiggle_bounce, b.wiggle_gravity = 0.5, 0.1
+            gravity, friction, bounce = 0.1, 0.5, 0.5
         else:
             return {'CANCELLED'}
-
-        # 4. UI 슬라이더 값 업데이트
+            
+        # 💡 [정밀 수정] 루프를 돌며 드래그 선택된 본 전체에 해당 물리 설정을 강제 대입시킵니다.
+        for b in selected_bones:
+            b.wiggle_stiff_use_dist = True
+            b.wiggle_damp_use_dist = True
+            b.wiggle_gravity = gravity
+            b.wiggle_friction = friction
+            b.wiggle_bounce = bounce
+            
         scene.wiggle_stiff_start = s_start
         scene.wiggle_stiff_end = s_end
         scene.wiggle_damp_start = d_start
         scene.wiggle_damp_end = d_end
-
-        # 5. 체인 전체에 즉시 분배 적용
+        
         apply_func(context, "wiggle_stiff", s_start, s_end)
         apply_func(context, "wiggle_damp", d_start, d_end)
-
-        # 6. 물리 엔진 리셋
-        bpy.ops.wiggle.reset() 
         
+        if bpy.ops.wiggle.reset.poll():
+            bpy.ops.wiggle.reset()
+            
         return {'FINISHED'}
 
 

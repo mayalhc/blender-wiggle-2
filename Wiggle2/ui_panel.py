@@ -31,73 +31,67 @@ class WigglePanel:
 class WIGGLE_PT_Settings(WigglePanel, bpy.types.Panel):
     bl_label = 'Wiggle 2 Physics'
     bl_idname = "WIGGLE_PT_Settings"
-    
+
     def draw(self, context):
         layout, scene, obj = self.layout, context.scene, context.object
-        
-        # --- [RTX 엔진 제어 UI - 주석 처리 보존] ---
-        # gpu_box = layout.box()
-        # active = getattr(scene, "wiggle_use_gpu", False)
-        # gpu_box.operator("wiggle.rtx_turbo", 
-        #                  text="STOP RTX ENGINE" if active else "START RTX ENGINE", 
-        #                  icon='CANCEL' if active else 'PLAY', 
-        #                  depress=active)
-        # if active:
-        #     inner = gpu_box.column(align=True)
-        #     try:
-        #         card, api = get_gpu_info_safe() 
-        #         inner.label(text=f"Device: {card}", icon='SOLO_ON')
-        #         inner.label(text=f"API: {api}", icon='SETTINGS')
-        #         is_playing = context.screen.is_animation_playing
-        #         if is_playing:
-        #             inner.label(text="Status: ⚡ RTX Calculating...", icon='PLAY')
-        #         else:
-        #             inner.label(text="Status: Core Link Standby", icon='PAUSE')
-        #     except:
-        #         inner.label(text="Establishing GPU Link...", icon='TIME')
-        # ------------------------------------------
-
         layout.separator()
 
         # 1. Scene Enable Toggle
         row = layout.row()
         row.prop(scene, "wiggle_enable", icon='SCENE_DATA' if scene.wiggle_enable else 'HIDE_ON', text="", emboss=False)
-        
-        if not scene.wiggle_enable: 
+        if not scene.wiggle_enable:
             row.label(text='Scene Muted.')
             return
-        
+
         # 2. Armature/Object Selection
         row = layout.row()
-        if getattr(obj, "wiggle_freeze", False): 
+        if getattr(obj, "wiggle_freeze", False):
             row.prop(obj, 'wiggle_freeze', icon='FREEZE', icon_only=True, emboss=False)
             row.label(text='Frozen (Baked)')
         else:
-            row.prop(obj, 'wiggle_mute', icon='ARMATURE_DATA' if not obj.wiggle_mute else 'HIDE_ON', 
-                     icon_only=True, invert_checkbox=True, emboss=False)
+            row.prop(obj, 'wiggle_mute', icon='ARMATURE_DATA' if not obj.wiggle_mute else 'HIDE_ON', icon_only=True, invert_checkbox=True, emboss=False)
             row.label(text=f"Object: {obj.name}")
 
-            # 현재 활성화된 본(pb) 확인
-            pb = context.active_pose_bone
-            if pb: 
-                # 3. Individual Bone Mute
-                row.prop(pb, 'wiggle_mute', icon='BONE_DATA' if not pb.wiggle_mute else 'HIDE_ON', 
-                         icon_only=True, invert_checkbox=True, emboss=False)
+        # Check Active Pose Bone
+        pb = context.active_pose_bone
+        if pb:
+            # 3. Individual Bone Mute
+            row.prop(pb, 'wiggle_mute', icon='BONE_DATA' if not pb.wiggle_mute else 'HIDE_ON', icon_only=True, invert_checkbox=True, emboss=False)
 
-                # 4. Limit Settings (Sim Mix가 삭제된 자리 바로 뒤)
-                layout.separator()
-                main_col = layout.column(align=True)
-                
-                icon = 'CHECKMARK' if getattr(pb, "wiggle_use_individual_limits", False) else 'RADIOBUT_OFF'
+            # 4. Limit Settings
+            layout.separator()
+            main_col = layout.column(align=True)
+            
+            # Safe registration synchronization for Blender 5.1.2 compatibility
+            if hasattr(pb, "id_properties_ensure"):
+                try: pb.id_properties_ensure()
+                except: pass
+
+            use_ind_limits = getattr(pb, "wiggle_use_individual_limits", False)
+            
+            # Render main toggle switch safely
+            if hasattr(pb, "wiggle_use_individual_limits"):
+                icon = 'CHECKMARK' if use_ind_limits else 'RADIOBUT_OFF'
                 main_col.prop(pb, "wiggle_use_individual_limits", text="Use Individual Limits", toggle=True, icon=icon)
-                
-                inner_box = main_col.box()
-                if getattr(pb, "wiggle_use_individual_limits", False):
-                    col = inner_box.column(align=True)
+            else:
+                main_col.label(text="Individual Limits property not initialized.", icon='INFO')
+
+            inner_box = main_col.box()
+            
+            if use_ind_limits:
+                col = inner_box.column(align=True)
+                if hasattr(pb, "wiggle_limit_x"):
                     col.prop(pb, "wiggle_limit_x", text="X (up and down)")
+                if hasattr(pb, "wiggle_limit_z"):
                     col.prop(pb, "wiggle_limit_z", text="Z (right and left)")
-                else:
+            else:
+                # Emergency Fallback: If Blender 5.1.2 internal registry lags, show graceful warning instead of crash
+                if hasattr(pb, "wiggle_angle_limit"):
                     inner_box.prop(pb, "wiggle_angle_limit", text="Total Limit")
+                elif "wiggle_angle_limit" in pb.keys():
+                    inner_box.prop(pb, '["wiggle_angle_limit"]', text="Total Limit")
+                else:
+                    inner_box.label(text="Total Limit property not loaded yet.", icon='INFO')
 
 
 class WIGGLE_PT_SimMixLayer_v3(bpy.types.Panel):
@@ -302,13 +296,24 @@ class WIGGLE_PT_Utilities(WigglePanel, bpy.types.Panel):
         r2.operator("wiggle.preset", text="Spring").type = 'SPRING'
         r2.operator("wiggle.preset", text="Antenna").type = 'ANTENNA'
         
-        layout.separator(); row = layout.row(align=True)
-        row.prop(scene, "wiggle_guide_shape", text="")
+        layout.separator()
+        row = layout.row(align=True)
+
+        if hasattr(scene, "wiggle_guide_shape"):
+            row.prop(scene, "wiggle_guide_shape", text="")
+            guide_shape = scene.wiggle_guide_shape
+        else:
+            guide_shape = 'BOX'
+
         g_icon = 'MESH_CUBE'
-        if scene.wiggle_guide_shape == 'CYLINDER': g_icon = 'MESH_CYLINDER'
-        elif scene.wiggle_guide_shape == 'CAPSULE': g_icon = 'MESH_CAPSULE'
+        if guide_shape == 'CYLINDER':
+            g_icon = 'MESH_CYLINDER'
+        elif guide_shape == 'CAPSULE':
+            g_icon = 'MESH_CAPSULE'
+
         row.operator("wiggle.toggle_bbox", text="Visual Guide", icon=g_icon)
-        
+
+                
         if hasattr(scene, "wiggle"):
             layout.prop(scene.wiggle, 'loop', text="Loop Physics")
             layout.prop(scene.wiggle, 'iterations', text="Quality")
@@ -348,27 +353,41 @@ class WIGGLE_PT_Bake(WigglePanel, bpy.types.Panel):
 class WIGGLE_PT_Safety(WigglePanel, bpy.types.Panel):
     bl_label = 'Wiggle Safety Guard'
     bl_idname = "WIGGLE_PT_Safety"
-    bl_parent_id = "WIGGLE_PT_Settings" 
+    bl_parent_id = "WIGGLE_PT_Settings"
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-        
+
+        # --- 1. Original Adaptive Safety Guard Block ---
         if not hasattr(scene, "wiggle_adaptive_damping"):
             layout.label(text="Error: Properties not registered.", icon='ERROR')
             return
 
         box = layout.box()
-        
         box.prop(scene, "wiggle_adaptive_damping", text="Adaptive Safety", icon='CHECKMARK')
-        
         col = box.column()
-
         col.enabled = scene.wiggle_adaptive_damping
         col.prop(scene, "wiggle_safety_threshold", text="Sensitivity", slider=True)
-        
         col.label(text="Auto-damps explosive motion.")
+        
+        layout.separator()
+
+        # --- 2. New Mesh Lattice Stabilizer Block ---
+        if not hasattr(scene, "wiggle_use_lattice"):
+            return
+
+        box_lattice = layout.box()
+        box_lattice.prop(scene, "wiggle_use_lattice", text="Mesh Lattice Stabilizer", icon='GRID')
+        
+        col_lattice = box_lattice.column(align=True)
+        col_lattice.enabled = scene.wiggle_use_lattice
+        
+        col_lattice.prop(scene, "wiggle_lattice_stiffness", text="Lattice Stiffness", slider=True)
+        col_lattice.prop(scene, "wiggle_lattice_show_debug", text="Show Lattice Guide", icon='RESTRICT_VIEW_OFF')
+
+
         
 class WIGGLE_PT_Promotion(WigglePanel, bpy.types.Panel):
     bl_label = "Groomforge PRO"
@@ -386,7 +405,7 @@ class WIGGLE_PT_Promotion(WigglePanel, bpy.types.Panel):
         
         # 2. 기존 마켓 버튼
         op = col.operator("wm.url_open", text="Get Groomforge PRO", icon='URL')
-        op.url = "https://superhivemarket.com"
+        op.url = "https://superhivemarket.com/products/groomforge"
         
         col.separator()
         
