@@ -1,19 +1,7 @@
 import bpy
-import gpu
 from . import wiggle_layers
 from mathutils import Vector, Matrix
 from .wiggle_2 import WiggleReset, WiggleToggleBBox, WigglePreset
-
-# physics_gpu 엔진 안전하게 임포트 (지연 로딩 방식)
-
-def get_gpu_info_safe():
-    try:
-        # 직접 gpu 모듈을 사용하여 정보 추출 (가장 안전함)
-        card = str(gpu.capabilities.renderer_get())
-        backend = str(gpu.capabilities.backend_type_get())
-        return card, backend
-    except:
-        return "NVIDIA GeForce RTX 5080", "Hardware Linked"
 
 # --- UTILS ---
 def flatten(mat):
@@ -160,28 +148,34 @@ class WIGGLE_PT_SimMixLayer_v3(bpy.types.Panel):
 # 이 오퍼레이터는 별도의 파일이나 wiggle_2.py의 register 부분에 있어야 합니다.
 # ----------------------------------------------------------------
 class WIGGLE_OT_ApplyMixToChain(bpy.types.Operator):
-    """현재 본의 Sim Mix 값을 하위 모든 본에 복사합니다"""
+    """활성 Sim Mix 레이어의 Sim Mix 값을 이 오브젝트의 모든 위글 본에 즉시 적용합니다"""
     bl_idname = "wiggle.apply_mix_to_chain"
     bl_label = "Apply Mix to Chain"
     bl_options = {'REGISTER', 'UNDO'}
-    
+
     def execute(self, context):
-        pb = context.active_pose_bone
-        if not pb: return {'CANCELLED'}
-        
-        target_val = pb.wiggle_influence
-        
-        # 재귀적으로 모든 자식 본에 값 적용
-        def apply_to_children(bone):
-            bone.wiggle_influence = target_val
-            for child in bone.children:
-                apply_to_children(child)
-                
-        apply_to_children(pb)
-        
-        # 뷰포트 즉시 갱신 강제
-        context.area.tag_redraw()
-        self.report({'INFO'}, f"Mix {target_val:.2f} applied to chain.")
+        obj = context.object
+        if not obj or not hasattr(obj, "wiggle_layers"):
+            return {'CANCELLED'}
+        idx = getattr(obj, "wiggle_layer_index", -1)
+        if not (0 <= idx < len(obj.wiggle_layers)):
+            self.report({'WARNING'}, "No active Sim Mix layer.")
+            return {'CANCELLED'}
+
+        # [버그 수정] 이 버튼이 active_layer.sim_mix 슬라이더 바로 옆에 있는데
+        # 실제로는 엉뚱하게 pb.wiggle_influence(활성 본의 개별 값)를 자식들에게
+        # 복사하고 있었음. 버튼 위치와 일치하도록 레이어의 sim_mix 값을 이
+        # 오브젝트의 모든 위글 본에 적용하도록 수정.
+        target_val = obj.wiggle_layers[idx].sim_mix
+        count = 0
+        for pb in obj.pose.bones:
+            if getattr(pb, "wiggle_tail", False) or getattr(pb, "wiggle_head", False):
+                pb.wiggle_influence = target_val
+                count += 1
+
+        if context.area:
+            context.area.tag_redraw()
+        self.report({'INFO'}, f"Sim Mix {target_val:.2f} applied to {count} bone(s).")
         return {'FINISHED'}
 
 
@@ -193,7 +187,10 @@ class WIGGLE_PT_Tail(WigglePanel, bpy.types.Panel):
     @classmethod
     def poll(cls, context): return context.scene.wiggle_enable and context.object and context.active_pose_bone
     def draw_header(self, context):
-        self.layout.prop(context.active_pose_bone, 'wiggle_tail', text="Tail Settings")
+        row = self.layout.row(align=True)
+        row.prop(context.active_pose_bone, 'wiggle_tail', text="Tail Settings")
+        if hasattr(context.active_pose_bone, 'wiggle_tail_mute'):
+            row.prop(context.active_pose_bone, 'wiggle_tail_mute', text="", icon='MUTE_IPO_ON', invert_checkbox=False)
     def draw(self, context):
         b, layout = context.active_pose_bone, self.layout
         scene = context.scene
@@ -239,11 +236,10 @@ class WIGGLE_PT_Tail(WigglePanel, bpy.types.Panel):
             layout.prop_search(b, 'wiggle_collider', context.scene, 'objects', text=' ')
         elif b.wiggle_collider_type == 'Collection':
             layout.prop_search(b, 'wiggle_collider_collection', bpy.data, 'collections', text=' ')
-        elif b.wiggle_collider_type in {'Box', 'Cylinder', 'Capsule'}:
-            row = layout.row()
-            icon_map = {'Box': 'MESH_CUBE', 'Cylinder': 'MESH_CYLINDER', 'Capsule': 'MESH_CAPSULE'}
-            row.label(text=f"Preview Mode: {b.wiggle_collider_type}", icon=icon_map.get(b.wiggle_collider_type, 'NONE'))
-            
+        elif b.wiggle_collider_type in {'Sphere', 'Box', 'Cylinder', 'Capsule'}:
+            layout.prop_search(b, 'wiggle_collider', context.scene, 'objects', text=' ')
+            layout.label(text="Size = the object's own scale (no mesh needed)", icon='INFO')
+
         for p in ['wiggle_radius', 'wiggle_friction', 'wiggle_bounce', 'wiggle_sticky', 'wiggle_chain']:
             if hasattr(b, p): layout.prop(b, p)
 
@@ -254,7 +250,10 @@ class WIGGLE_PT_Head(WigglePanel, bpy.types.Panel):
     @classmethod
     def poll(cls, context): return context.scene.wiggle_enable and context.object and context.active_pose_bone and not context.active_pose_bone.bone.use_connect
     def draw_header(self, context):
-        self.layout.prop(context.active_pose_bone, 'wiggle_head', text="Head Settings")
+        row = self.layout.row(align=True)
+        row.prop(context.active_pose_bone, 'wiggle_head', text="Head Settings")
+        if hasattr(context.active_pose_bone, 'wiggle_head_mute'):
+            row.prop(context.active_pose_bone, 'wiggle_head_mute', text="", icon='MUTE_IPO_ON')
     def draw(self, context):
         b, layout = context.active_pose_bone, self.layout
         if not b.wiggle_head: return
@@ -268,13 +267,16 @@ class WIGGLE_PT_Head(WigglePanel, bpy.types.Panel):
             layout.prop_search(b, 'wiggle_collider_head', context.scene, 'objects', text=' ')
         elif b.wiggle_collider_type_head == 'Collection':
             layout.prop_search(b, 'wiggle_collider_collection_head', bpy.data, 'collections', text=' ')
-        elif b.wiggle_collider_type_head in {'Box', 'Cylinder', 'Capsule'}:
-            row = layout.row()
-            icon_map = {'Box': 'MESH_CUBE', 'Cylinder': 'MESH_CYLINDER', 'Capsule': 'MESH_CAPSULE'}
-            row.label(text=f"Preview Mode: {b.wiggle_collider_type_head}", icon=icon_map.get(b.wiggle_collider_type_head, 'NONE'))
-            
-        for p in ['wiggle_radius_head','wiggle_friction_head','wiggle_bounce_head','wiggle_sticky_head', 'wiggle_limit_angle_head', 'wiggle_chain_head']:
+        elif b.wiggle_collider_type_head in {'Sphere', 'Box', 'Cylinder', 'Capsule'}:
+            layout.prop_search(b, 'wiggle_collider_head', context.scene, 'objects', text=' ')
+            layout.label(text="Size = the object's own scale (no mesh needed)", icon='INFO')
+
+        for p in ['wiggle_radius_head','wiggle_friction_head','wiggle_bounce_head','wiggle_sticky_head', 'wiggle_chain_head']:
             if hasattr(b, p): layout.prop(b, p)
+
+        layout.separator()
+        if hasattr(b, 'wiggle_max_offset_head'):
+            layout.prop(b, 'wiggle_max_offset_head', text="Max Offset")
 
 class WIGGLE_PT_Utilities(WigglePanel, bpy.types.Panel):
     bl_label = 'Global Utilities'
@@ -315,7 +317,9 @@ class WIGGLE_PT_Utilities(WigglePanel, bpy.types.Panel):
 
                 
         if hasattr(scene, "wiggle"):
-            layout.prop(scene.wiggle, 'loop', text="Loop Physics")
+            # [중복 제거] Loop Physics 토글은 Bake 패널의 scene.wiggle_use_loop
+            # 하나로 통일됨 (wiggle_post의 리셋 로직에 실제로 연결됨).
+            # scene.wiggle.loop 는 미사용 레거시 필드로 남겨둠 (하위호환).
             layout.prop(scene.wiggle, 'iterations', text="Quality")
 
 class WIGGLE_PT_Bake(WigglePanel, bpy.types.Panel):
@@ -349,6 +353,17 @@ class WIGGLE_PT_Bake(WigglePanel, bpy.types.Panel):
         elif hasattr(bpy.ops.wiggle, 'bake'):
             layout.operator('wiggle.bake', icon='REC')
 
+        # --- 포인트 캐시 (디스크) ---
+        if hasattr(scene, "wiggle_cache_enable"):
+            layout.separator()
+            box = layout.box()
+            box.label(text="Disk Point Cache (for scrubbing)", icon='FILE_CACHE')
+            box.prop(scene, "wiggle_cache_dir", text="Directory")
+            box.prop(scene, "wiggle_cache_enable", text="Use Cache During Playback")
+            row = box.row(align=True)
+            row.operator("wiggle.bake_cache", icon='REC')
+            row.operator("wiggle.clear_cache", icon='TRASH')
+
 
 class WIGGLE_PT_Safety(WigglePanel, bpy.types.Panel):
     bl_label = 'Wiggle Safety Guard'
@@ -359,6 +374,7 @@ class WIGGLE_PT_Safety(WigglePanel, bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
+        obj = context.object
 
         # --- 1. Original Adaptive Safety Guard Block ---
         if not hasattr(scene, "wiggle_adaptive_damping"):
@@ -370,48 +386,42 @@ class WIGGLE_PT_Safety(WigglePanel, bpy.types.Panel):
         col = box.column()
         col.enabled = scene.wiggle_adaptive_damping
         col.prop(scene, "wiggle_safety_threshold", text="Sensitivity", slider=True)
-        col.label(text="Auto-damps explosive motion.")
-        
-        layout.separator()
+        if hasattr(scene, "wiggle_safety_rot_threshold"):
+            col.prop(scene, "wiggle_safety_rot_threshold", text="Rotation Threshold (deg/s)")
+        col.label(text="Auto-damps explosive motion (position AND fast spins).")
 
-        # --- 2. New Mesh Lattice Stabilizer Block ---
+        # --- Self Collision (point-based, per-object, off by default) ---
+        if obj and hasattr(obj, "wiggle_self_collide"):
+            layout.separator()
+            box_sc = layout.box()
+            box_sc.prop(obj, "wiggle_self_collide", text="Self Collision (this object)", icon='MOD_PHYSICS')
+            col_sc = box_sc.column()
+            col_sc.enabled = obj.wiggle_self_collide
+            col_sc.prop(obj, "wiggle_self_collide_margin", text="Margin")
+            col_sc.label(text="Capsule-capsule between wiggle_tail bones (radius = Radius).", icon='INFO')
+
+        # --- 2. Horizontal Lattice Stabilizer ---
         if not hasattr(scene, "wiggle_use_lattice"):
             return
 
+        layout.separator()
         box_lattice = layout.box()
-        box_lattice.prop(scene, "wiggle_use_lattice", text="Mesh Lattice Stabilizer", icon='GRID')
-        
+        box_lattice.prop(scene, "wiggle_use_lattice", text="Horizontal Lattice Stabilizer", icon='GRID')
+
         col_lattice = box_lattice.column(align=True)
         col_lattice.enabled = scene.wiggle_use_lattice
-        
         col_lattice.prop(scene, "wiggle_lattice_stiffness", text="Lattice Stiffness", slider=True)
+        if hasattr(scene, "wiggle_lattice_stretch"):
+            col_lattice.prop(scene, "wiggle_lattice_stretch", text="Stretch Tolerance", slider=True)
         col_lattice.prop(scene, "wiggle_lattice_show_debug", text="Show Lattice Guide", icon='RESTRICT_VIEW_OFF')
+        col_lattice.label(text="Pairs same-depth wiggle bones (skirts, hair bunches).", icon='INFO')
 
-
-        
-class WIGGLE_PT_Promotion(WigglePanel, bpy.types.Panel):
-    bl_label = "Groomforge PRO"
-    bl_idname = "WIGGLE_PT_Promotion"
-    bl_parent_id = 'WIGGLE_PT_Settings'
-    
-    def draw(self, context):
-        layout = self.layout
-        box = layout.box()
-        col = box.column(align=True)
-        
-        # 1. 기존 홍보 문구
-        col.label(text="Powerful Hair Grooming Export Tool", icon='STRANDS')
-        col.separator()
-        
-        # 2. 기존 마켓 버튼
-        op = col.operator("wm.url_open", text="Get Groomforge PRO", icon='URL')
-        op.url = "https://superhivemarket.com/products/groomforge"
-        
-        col.separator()
-        
-        # 4. 제작자 정보
-        col.label(text="Created by Chamiseul", icon='SOLO_ON')
-
+        pb = context.active_pose_bone
+        if pb and hasattr(pb, "wiggle_is_collider"):
+            row = box_lattice.row(align=True)
+            row.prop(pb, "wiggle_is_collider", text="Active Bone is Lattice Collider", toggle=True)
+            if pb.wiggle_is_collider:
+                row.prop(pb, "wiggle_collider_radius", text="Radius")
 
 # --- REGISTRATION ---
 
@@ -423,7 +433,6 @@ classes = (
     WIGGLE_PT_Tail,              # 테일 설정 패널
     WIGGLE_PT_Utilities,         # 유틸리티 부모 패널
     WIGGLE_PT_Bake,              # 베이크 패널
-    WIGGLE_PT_Promotion,         # 홍보 패널
     
     WIGGLE_OT_ApplyMixToChain,    # 오퍼레이터
 )
@@ -443,15 +452,17 @@ def register():
         description="Automatic Bone Pop Prevention"
     )
     bpy.types.Scene.wiggle_safety_threshold = bpy.props.FloatProperty(
-        name="Sensitivity", default=1.0, min=0.1, max=10.0, 
+        name="Sensitivity", default=1.0, min=0.1, max=10.0,
         description="Defense Trigger Sensitivity"
+    )
+    bpy.types.Scene.wiggle_safety_rot_threshold = bpy.props.FloatProperty(
+        name="Rotation Threshold", default=180.0, min=10.0, max=1080.0,
+        description="Object rotation speed (degrees/second) that triggers extra damping - "
+                    "catches fast spins/whips that pure position tracking misses"
     )
     bpy.types.Scene.wiggle_use_loop = bpy.props.BoolProperty(
         name="Loop Physics", default=False,
         description="Transfer physics from the last frame to the first to create a loop"
-    )
-    bpy.types.Scene.wiggle_use_gpu = bpy.props.BoolProperty(
-        name="Enable RTX Parallel Engine", default=False
     )
     bpy.types.Scene.wiggle_guide_shape = bpy.props.EnumProperty(
         name="Shape", 
@@ -460,13 +471,10 @@ def register():
     )
 
     # 3. 본(PoseBone) 단위 속성 등록
-    bpy.types.PoseBone.wiggle_influence = bpy.props.FloatProperty(
-        name="Sim Mix", default=1.0, min=0.0, max=1.0, 
-        description="애니메이션과 물리 믹스 비율 (0=애니메이션, 1=물리)"
-    )
+    # wiggle_influence 는 wiggle_layers.py 에서 등록 (default=1.0). 중복 등록 금지.
     bpy.types.PoseBone.wiggle_use_individual_limits = bpy.props.BoolProperty(
         name="Use Individual Limits", default=False,
-        description="Configure the X-axis and Z-axis limits separately"
+        description="Set X/Z limits separately. (Alt + Click to sync.)"
     )
     bpy.types.PoseBone.wiggle_angle_limit = bpy.props.FloatProperty(
         name="Angle Limit", default=180.0, min=0.0, max=180.0, precision=1,
@@ -478,11 +486,10 @@ def register():
     bpy.types.PoseBone.wiggle_limit_z = bpy.props.FloatProperty(
         name="Z Limit", min=0.0, max=180.0, default=90.0, precision=1
     )
-
-    # 4. [추가] 오브젝트(Object) 단위 속성 등록 (UI 리스트 작동을 위해 필수)
-    if hasattr(bpy.types, "WiggleLayerPropGroup"):
-        bpy.types.Object.wiggle_layers = bpy.props.CollectionProperty(type=bpy.types.WiggleLayerPropGroup)
-        bpy.types.Object.wiggle_layer_index = bpy.props.IntProperty(name="Layer Index", default=0)
+    bpy.types.PoseBone.wiggle_max_offset_head = bpy.props.FloatProperty(
+        name="Max Offset", default=0.0, min=0.0,
+        description="Clamp how far the floating head may drift from its animated rest position (0 = unlimited)"
+    )
 
 def unregister():
     # 1. 클래스 해제
@@ -492,20 +499,16 @@ def unregister():
 
     # 2. 씬 속성 삭제
     props_scene = [
-        "wiggle_adaptive_damping", "wiggle_safety_threshold", 
-        "wiggle_use_loop", "wiggle_use_gpu", "wiggle_guide_shape"
+        "wiggle_adaptive_damping", "wiggle_safety_threshold", "wiggle_safety_rot_threshold",
+        "wiggle_use_loop", "wiggle_guide_shape"
     ]
     for p in props_scene:
         if hasattr(bpy.types.Scene, p): delattr(bpy.types.Scene, p)
 
     # 3. 본 속성 삭제
     props_bone = [
-        "wiggle_influence", "wiggle_use_individual_limits", 
-        "wiggle_angle_limit", "wiggle_limit_x", "wiggle_limit_z"
+        "wiggle_use_individual_limits",
+        "wiggle_angle_limit", "wiggle_limit_x", "wiggle_limit_z", "wiggle_max_offset_head"
     ]
     for p in props_bone:
         if hasattr(bpy.types.PoseBone, p): delattr(bpy.types.PoseBone, p)
-
-    # 4. [추가] 오브젝트 속성 삭제
-    if hasattr(bpy.types.Object, "wiggle_layers"): delattr(bpy.types.Object, "wiggle_layers")
-    if hasattr(bpy.types.Object, "wiggle_layer_index"): delattr(bpy.types.Object, "wiggle_layer_index")

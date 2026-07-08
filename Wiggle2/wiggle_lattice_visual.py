@@ -26,8 +26,15 @@ class WiggleRTXHorizontalEngine:
         if not pose_bones:
             return
 
+        # [버그 수정] 전체 본이 아니라 wiggle_tail이 켜진 본만 대상으로 함.
+        # 원래 코드는 팔/갈비뼈처럼 같은 깊이(depth)에 있는 전혀 무관한 본까지
+        # 짝지어서 evaluate_physics()에서 회전시켜버리는 문제가 있었음.
+        wiggle_bones = [pb for pb in pose_bones if getattr(pb, "wiggle_tail", False)]
+        if len(wiggle_bones) < 3:
+            return
+
         matrix_map = {}
-        for pb in pose_bones:
+        for pb in wiggle_bones:
             depth = 0
             parent = pb.parent
             while parent:
@@ -51,13 +58,13 @@ class WiggleRTXHorizontalEngine:
                 first_pos = self.obj.matrix_world @ sorted_bones_base[0].head
                 last_pos = self.obj.matrix_world @ sorted_bones_base[-1].head
                 edge_dist = (first_pos - last_pos).length
-                
+
                 total_dist = 0
                 for i in range(num_bones - 1):
                     p1 = self.obj.matrix_world @ sorted_bones_base[i].head
                     p2 = self.obj.matrix_world @ sorted_bones_base[i + 1].head
                     total_dist += (p1 - p2).length
-                
+
                 avg_dist = total_dist / (num_bones - 1) if num_bones > 1 else 1.0
                 if edge_dist < avg_dist * 2.5: # 판정 범위를 살짝 넓혀 링 구조 안정적 포착
                     is_ring = True
@@ -84,18 +91,18 @@ class WiggleRTXHorizontalEngine:
 
                 # 각도순(-PI ~ PI)으로 본을 완벽하게 원형 정렬
                 sorted_ring_bones = sorted(bones, key=get_horizontal_angle)
-                
+
                 # 순서대로 이웃한 본끼리만 링 형태로 체인 연결 (가로지르기 방지)
                 for i in range(num_bones):
                     bone_A = sorted_ring_bones[i]
                     bone_B = sorted_ring_bones[(i + 1) % num_bones] # 마지막 본은 다시 첫 번째 본과 연결
-                    
+
                     w_tail_A = self.obj.matrix_world @ bone_A.tail
                     w_tail_B = self.obj.matrix_world @ bone_B.tail
                     tail_dist = (w_tail_A - w_tail_B).length
-                    
+
                     # 원형 구조 특성상 링크 제한 거리를 유연하게 설정 (필요시 5.0보다 크게 조절)
-                    if tail_dist < 10.0: 
+                    if tail_dist < 10.0:
                         self.tail_pairs.append((bone_A.name, bone_B.name, tail_dist))
             else:
                 # 평면 일직선 본 구조일 때의 기존 연결 로직
@@ -110,8 +117,14 @@ class WiggleRTXHorizontalEngine:
 
         print(f"[Wiggle RTX] Build completed: Cached {len(self.tail_pairs)} horizontal links.")
 
+    def _mesh_name(self):
+        # [버그 수정] 이름이 "Lattice_Mesh"로 고정이라 아마추어가 두 개 이상일 때
+        # 서로의 메쉬/엔진 데이터를 덮어썼음. 아마추어 이름을 포함해 유일하게 만듦.
+        return f"Lattice_Mesh_{self.obj.name}"
+
     def create_lattice_mesh(self):
-        existing_obj = bpy.data.objects.get("Lattice_Mesh")
+        mesh_name = self._mesh_name()
+        existing_obj = bpy.data.objects.get(mesh_name)
         if existing_obj:
             self.mesh_obj = existing_obj
             self.mesh_obj["wiggle_target_armature"] = self.obj.name
@@ -121,19 +134,19 @@ class WiggleRTXHorizontalEngine:
         if not self.tail_pairs:
             return
 
-        mesh_data = bpy.data.meshes.new(name="Wiggle_Lattice_Mesh_Data")
+        mesh_data = bpy.data.meshes.new(name=f"Wiggle_Lattice_Mesh_Data_{self.obj.name}")
         verts = []
         edges = []
-        
+
         for i, (name_A, name_B, _) in enumerate(self.tail_pairs):
             verts.append((0.0, 0.0, 0.0))
             verts.append((0.0, 0.0, 0.0))
             edges.append((i * 2, i * 2 + 1))
-            
+
         mesh_data.from_pydata(verts, edges, [])
         mesh_data.update()
 
-        self.mesh_obj = bpy.data.objects.new(name="Lattice_Mesh", object_data=mesh_data)
+        self.mesh_obj = bpy.data.objects.new(name=mesh_name, object_data=mesh_data)
         self.mesh_obj["wiggle_target_armature"] = self.obj.name
         bpy.context.scene.collection.objects.link(self.mesh_obj)
         self.update_mesh_vertices()
@@ -156,10 +169,10 @@ class WiggleRTXHorizontalEngine:
         for i, (name_A, name_B, _) in enumerate(self.tail_pairs):
             if name_A not in pose_bones or name_B not in pose_bones:
                 continue
-                
+
             w_tail_A = mat_world @ pose_bones[name_A].tail
             w_tail_B = mat_world @ pose_bones[name_B].tail
-            
+
             mesh_data.vertices[i * 2].co = w_tail_A
             mesh_data.vertices[i * 2 + 1].co = w_tail_B
 
@@ -182,20 +195,23 @@ class WiggleRTXHorizontalEngine:
             mat_world = self.obj.matrix_world
         except ReferenceError:
             return False
-            
+
         self.update_mesh_vertices()
-        
+
         if not context.screen.is_animation_playing:
             return True
 
         mat_world_inv = mat_world.inverted()
 
-        for pb in pose_bones:
-            pb.scale.x = pb.scale.x + (1.0 - pb.scale.x) * self.damping_to_rest
+        # [수정] pb.scale 직접 조작 제거 — wiggle_2 stretch 연산과 충돌하여 본 찌그러짐 발생
 
         colliders_data = []
         for pb in pose_bones:
-            if getattr(pb, "wiggle_is_collider", False) or hasattr(pb, "wiggle_collider_radius"):
+            # [버그 수정] wiggle_collider_radius를 이제 모든 본에 전역 등록하기
+            # 때문에 hasattr()은 항상 True가 됨 - "or hasattr(...)"이 있으면
+            # wiggle_is_collider 토글과 무관하게 모든 본이 콜라이더가 되어버림.
+            # 실제 토글 값만으로 판단해야 함.
+            if getattr(pb, "wiggle_is_collider", False):
                 c_loc = mat_world @ pb.head
                 c_rad = getattr(pb, "wiggle_collider_radius", 0.03)
                 colliders_data.append((c_loc, c_rad))
@@ -212,20 +228,25 @@ class WiggleRTXHorizontalEngine:
             if current_dist == 0:
                 continue
             delta = current_dist - rest_dist
-            if abs(delta) < 0.002:
+            pair_key = (name_A, name_B)
+
+            # [버그 수정] current_stretch가 받아만 놓고 안 쓰이던 죽은 매개변수였음.
+            # 데드존(허용 오차) 크기로 실제 사용 - 값이 클수록 더 늘어나도록 허용.
+            tolerance = max(0.0005, current_stretch)
+            if abs(delta) < tolerance:
+                # [버그 수정] self.damping_to_rest도 설정만 되고 안 쓰이던 값.
+                # 보정이 필요 없어진 쌍은 이전 힘을 서서히 감쇠시켜 뚝 끊기지 않게 함.
+                if pair_key in self.prev_force_dirs:
+                    self.prev_force_dirs[pair_key] = self.prev_force_dirs[pair_key] * (1.0 - self.damping_to_rest)
                 continue
 
             local_force_dir = (mat_world_inv.to_3x3() @ current_vec.normalized()) * delta
-            stretch_offset = (delta / rest_dist) * current_stretch
-            pb_A.scale.x = max(0.99, min(1.01, pb_A.scale.x + stretch_offset * 0.1))
-            pb_B.scale.x = max(0.99, min(1.01, pb_B.scale.x + stretch_offset * 0.1))
-
             collision_offset = mathutils.Vector((0, 0, 0))
             for c_loc, c_rad in colliders_data:
                 to_tail_A = w_tail_A - c_loc
                 if to_tail_A.length < c_rad and to_tail_A.length > 0:
                     collision_offset += to_tail_A.normalized() * (c_rad - to_tail_A.length)
-                
+
                 to_tail_B = w_tail_B - c_loc
                 if to_tail_B.length < c_rad and to_tail_B.length > 0:
                     collision_offset += to_tail_B.normalized() * (c_rad - to_tail_B.length)
@@ -234,11 +255,25 @@ class WiggleRTXHorizontalEngine:
                 local_col_dir = mat_world_inv.to_3x3() @ collision_offset
                 local_force_dir += local_col_dir * 3.0
 
+            # [버그 수정] self.stretch_elasticity/self.prev_force_dirs도 설정만 되고
+            # 안 쓰이던 값들 - 이전 프레임 힘 방향과 블렌딩해서 급격한 스냅 방지.
+            prev_dir = self.prev_force_dirs.get(pair_key, local_force_dir)
+            blend_fac = max(0.0, min(1.0, 1.0 - self.stretch_elasticity))
+            local_force_dir = prev_dir.lerp(local_force_dir, blend_fac)
+            self.prev_force_dirs[pair_key] = local_force_dir
+
             bone_local_y = mathutils.Vector((0, 1, 0))
             target_direction = (bone_local_y + local_force_dir * current_stiffness * 0.5).normalized()
             rot_offset = bone_local_y.rotation_difference(target_direction)
             if pb_A.rotation_mode == 'QUATERNION':
                 pb_A.rotation_quaternion = pb_A.rotation_quaternion @ rot_offset
+            elif pb_A.rotation_mode == 'AXIS_ANGLE':
+                # [버그 수정] AXIS_ANGLE 모드는 원래 아예 처리되지 않아 회전이 씹혔음.
+                aa = pb_A.rotation_axis_angle
+                cur_q = mathutils.Quaternion((aa[1], aa[2], aa[3]), aa[0])
+                new_q = cur_q @ rot_offset
+                axis, angle = new_q.to_axis_angle()
+                pb_A.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
             else:
                 pb_A.rotation_euler.rotate(rot_offset)
         return True
@@ -254,7 +289,7 @@ def update_lattice_show_debug(self, context):
         for old_obj in old_objs:
             try: old_obj.hide_viewport = False
             except: pass
-            
+
     for window in context.window_manager.windows:
         for area in window.screen.areas:
             if area.type == 'VIEW_3D':
@@ -316,26 +351,28 @@ class WiggleRTX_ModalVisualOperator(bpy.types.Operator):
     def invoke(self, context, event):
         if WiggleRTX_ModalVisualOperator._is_running:
             return {'FINISHED'}
-            
+
         active_obj = None
-        existing_mesh = bpy.data.objects.get("Lattice_Mesh")
+        # [버그 수정] 메쉬 이름을 "Lattice_Mesh"에서 "Lattice_Mesh_<아마추어명>"으로
+        # 바꿨으므로(다중 아마추어 이름 충돌 방지) 정확히 일치가 아니라 접두사로 찾아야 함.
+        existing_mesh = next((o for o in bpy.data.objects if o.name.startswith("Lattice_Mesh_")), None)
         if existing_mesh and "wiggle_target_armature" in existing_mesh:
             active_obj = bpy.data.objects.get(existing_mesh["wiggle_target_armature"])
-            
+
         if not active_obj:
             active_obj = context.view_layer.objects.active
-            
+
         if not active_obj or active_obj.type != 'ARMATURE':
             self.report({'ERROR'}, "Select an Armature Object first!")
             return {'CANCELLED'}
-            
+
         global _WIGGLE_RTX_GL_ENGINE
         _WIGGLE_RTX_GL_ENGINE = WiggleRTXHorizontalEngine(active_obj)
-        
+
         if not context.scene.wiggle_lattice_show_debug:
             if _WIGGLE_RTX_GL_ENGINE.mesh_obj:
                 _WIGGLE_RTX_GL_ENGINE.mesh_obj.hide_viewport = True
-        
+
         wm = context.window_manager
         WiggleRTX_ModalVisualOperator._timer = wm.event_timer_add(0.01, window=context.window)
         wm.modal_handler_add(self)
@@ -351,7 +388,7 @@ class WiggleRTX_ModalVisualOperator(bpy.types.Operator):
             except:
                 pass
             WiggleRTX_ModalVisualOperator._timer = None
-            
+
         _WIGGLE_RTX_GL_ENGINE = None
         WiggleRTX_ModalVisualOperator._is_running = False
         return {'CANCELLED'}
@@ -370,7 +407,38 @@ def register():
     if auto_start_lattice_on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(auto_start_lattice_on_load)
 
+    # [버그 수정] evaluate_physics()가 참조하던 wiggle_is_collider /
+    # wiggle_collider_radius가 어디에도 등록돼 있지 않아서 자기충돌 회피
+    # 기능이 원천적으로 켜질 수 없었음. 실제 프로퍼티로 등록.
+    if not hasattr(bpy.types.PoseBone, "wiggle_is_collider"):
+        bpy.types.PoseBone.wiggle_is_collider = bpy.props.BoolProperty(
+            name="Lattice Collider",
+            description="Nearby lattice pairs push away from this bone's head",
+            default=False
+        )
+    if not hasattr(bpy.types.PoseBone, "wiggle_collider_radius"):
+        bpy.types.PoseBone.wiggle_collider_radius = bpy.props.FloatProperty(
+            name="Lattice Collider Radius", default=0.03, min=0.0
+        )
+
+    # [버그 수정] wiggle_lattice_stretch도 evaluate_physics()에 값은 넘어갔지만
+    # Scene 프로퍼티로 등록된 적이 없어 항상 getattr 기본값(0.01)만 쓰였음.
+    if not hasattr(bpy.types.Scene, "wiggle_lattice_stretch"):
+        bpy.types.Scene.wiggle_lattice_stretch = bpy.props.FloatProperty(
+            name="Lattice Stretch Tolerance",
+            description="How much a lattice pair can deviate before being pulled back",
+            default=0.01, min=0.0, max=1.0
+        )
+
 def unregister():
     if auto_start_lattice_on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(auto_start_lattice_on_load)
     bpy.utils.unregister_class(WiggleRTX_ModalVisualOperator)
+
+    for attr in ("wiggle_is_collider", "wiggle_collider_radius"):
+        if hasattr(bpy.types.PoseBone, attr):
+            try: delattr(bpy.types.PoseBone, attr)
+            except Exception: pass
+    if hasattr(bpy.types.Scene, "wiggle_lattice_stretch"):
+        try: delattr(bpy.types.Scene, "wiggle_lattice_stretch")
+        except Exception: pass
