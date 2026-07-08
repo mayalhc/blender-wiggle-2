@@ -29,7 +29,7 @@ Keeping this tool alive requires constant testing and code updates as Blender ev
 [❤️[Support me on Ko-fi]](https://ko-fi.com/chamiseul38637)
 
 ### Meet the Maintainer's Other Tools
-I am also developing **[GroomForge](https://superhivemarket.com/products/groomforge)**—a professional auto-rigging & Alembic exporter for hair. It's designed to work hand-in-hand with Wiggle 2 RTX for the ultimate hair physics experience!
+I am also developing **[GroomForge]([https://superhivemarket.com/products/groomforge](https://superhivemarket.com/creators/chamiseul))**—a professional auto-rigging & Alembic exporter for hair. It's designed to work hand-in-hand with Wiggle 2 RTX for the ultimate hair physics experience!
 
 ---
 *(The original README content by shteeve3d continues below)*
