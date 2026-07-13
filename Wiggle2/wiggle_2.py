@@ -1,12 +1,3 @@
-
-### TO DO #####
-
-# Basic object wiggle?
-# handle inherit rotation?
-
-# bugs:
-# weird glitch when starting playback?
-
 import bpy, math
 from bpy.app.handlers import persistent
 from mathutils import Vector, Matrix, Quaternion, noise
@@ -27,6 +18,8 @@ def reset_scene():
         reset_ob(bpy.data.objects.get(wo.name))
                               
 def reset_ob(ob):
+    if not ob:
+        return
     # 1. 해당 오브젝트의 위글 데이터를 가져옴
     wo = bpy.context.scene.wiggle.list.get(ob.name)
 
@@ -126,8 +119,17 @@ def update_prop(self, context, prop):
     try:
         if isinstance(self, bpy.types.PoseBone):
             selected = list(getattr(context, "selected_pose_bones", None) or [])
+            # [버그 수정] "b is self"(정체성 비교)를 썼는데, Blender는
+            # context.selected_pose_bones로 얻은 본과 update 콜백의 self가
+            # 같은 본이어도 서로 다른 Python 래퍼 객체일 수 있다(다른
+            # NLA/PropertyGroup 관련 코드에서도 같은 문제를 발견/수정함).
+            # 그러면 "이미 값이 설정된 self"를 못 알아보고 다시
+            # setattr해서 자기 자신에게 여러 본 선택 시 예상 못 한 순서로
+            # 값이 되돌아오거나, reset_bone()이 활성 본에는 절대 안 불리는
+            # 등 본마다 결과가 달라 보이는 문제가 있었다. 이름 비교로
+            # 바꾼다.
             for b in selected:
-                if b is self:
+                if b.name == self.name:
                     continue
                 try:
                     setattr(b, prop, val)
@@ -139,6 +141,9 @@ def update_prop(self, context, prop):
                     for b in selected:
                         try: rb(b)
                         except Exception: pass
+                    if not any(b.name == self.name for b in selected):
+                        try: rb(self)
+                        except Exception: pass
                 bl = globals().get('build_list')
                 if bl:
                     try: bl()
@@ -147,6 +152,44 @@ def update_prop(self, context, prop):
         context.scene["wiggle_updating"] = False
 
 _GET_PARENT_CACHE = {}
+
+# Sim Mix Layers의 Layer Weight/Sim Mix 슬라이더가 실제 프레임을 바꾸지
+# 않고도 즉시 미리보기를 갱신할 수 있도록, 마지막 실제 프레임에서 계산된
+# (애니메이션 회전, 시뮬레이션 회전, rotation_mode, 애니메이션 위치, 시뮬
+# 레이션 위치)를 본별로 저장해둔다. 키: (오브젝트 이름, 본 이름).
+# refresh_influence_blend()에서 소비.
+_LAST_BLEND_CACHE = {}
+
+
+def refresh_influence_blend(obj):
+    """실제 프레임을 바꾸지 않고(=물리를 다시 계산하지 않고), 마지막으로
+    계산된 애니메이션/시뮬레이션 포즈를 현재 wiggle_influence 값으로 다시
+    블렌드해서 뷰포트에 즉시 반영한다. Sim Mix Layers의 Layer Weight/Sim
+    Mix 슬라이더를 움직였을 때(타임라인은 그대로) 호출한다. 물리나 프레임을
+    건드리지 않으므로 리셋/속도 손실 같은 부작용이 전혀 없다."""
+    if not obj or obj.type != 'ARMATURE':
+        return
+    changed = False
+    for b in obj.pose.bones:
+        cached = _LAST_BLEND_CACHE.get((obj.name, b.name))
+        if not cached:
+            continue
+        anim_q, sim_q, rmode, anim_loc, sim_loc, anim_scale, sim_scale = cached
+        inf = getattr(b, "wiggle_influence", 1.0)
+        blended_q = anim_q.slerp(sim_q, inf)
+        if rmode == 'QUATERNION':
+            b.rotation_quaternion = blended_q
+        elif rmode == 'AXIS_ANGLE':
+            axis, angle = blended_q.to_axis_angle()
+            b.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
+        else:
+            b.rotation_euler = blended_q.to_euler(rmode)
+        b.location = anim_loc.lerp(sim_loc, inf)
+        b.scale = anim_scale.lerp(sim_scale, inf)
+        changed = True
+    if changed and obj.id_data:
+        obj.id_data.update_tag()
+
 
 def clear_parent_cache():
     """get_parent()의 결과는 한 프레임 안에서는 절대 바뀌지 않는데(같은 프레임
@@ -1090,17 +1133,6 @@ def constrain(b, i, dg, dt=None, iterations=None):
 
 
 @persistent
-def wiggle_pre(scene, depsgraph=None):
-    if not scene.wiggle_enable: return
-    if scene.get("wiggle_updating"): return
-    for obj in scene.objects:
-        if obj.type != 'ARMATURE' or not obj.wiggle_enable or obj.wiggle_mute: continue
-        for pb in obj.pose.bones:
-            if not pb.wiggle_enable or pb.wiggle_mute: continue
-            if (pb.wiggle_head or pb.wiggle_tail) and not pb.wiggle_mute:
-                pass
-
-@persistent
 def wiggle_post(scene, dg):
     w = scene.wiggle
     cf = scene.frame_current
@@ -1220,8 +1252,16 @@ def wiggle_post(scene, dg):
         active_bones = [b for b in active_bones if b is not None]
         if not active_bones: continue
 
-        orig_rots = {b.name: b.rotation_quaternion.copy() if b.rotation_mode == 'QUATERNION' 
+        orig_rots = {b.name: b.rotation_quaternion.copy() if b.rotation_mode == 'QUATERNION'
                      else b.rotation_euler.to_quaternion() for b in active_bones}
+        # [버그 수정] wiggle_influence 블렌드가 회전만 되돌리고 위치는
+        # 전혀 되돌리지 않아서, 헤드가 플로팅인(use_connect 아님) 본은
+        # influence를 0으로 내려도 물리가 옮겨놓은 위치에 그대로 남아
+        # 코일처럼 튀어나와 보이던 문제. 애니메이션 원본 위치도 함께 캐시.
+        orig_locs = {b.name: b.location.copy() for b in active_bones}
+        # Stretch로 인한 스케일도 회전/위치와 마찬가지로 되돌려야 함
+        # (안 그러면 influence=0이어도 늘어난/찌그러진 모양이 남음).
+        orig_scales = {b.name: b.scale.copy() for b in active_bones}
 
         for b in active_bones:
             if hasattr(b.wiggle, "adaptive_damp_mod"):
@@ -1248,11 +1288,53 @@ def wiggle_post(scene, dg):
         for b in active_bones:
             update_matrix(b, True)
             inf = getattr(b, "wiggle_influence", 1.0)
+
+            # [버그 수정] Sim Mix Layers의 Layer Weight/Sim Mix가 최종 포즈에
+            # 전혀 반영되지 않던 문제. (1) b.rotation_quaternion에만 썼는데,
+            # rotation_mode가 QUATERNION이 아니면(대부분의 게임/UE5용
+            # 리그는 Euler를 씀) Blender가 그 채널을 아예 평가에 쓰지 않아서
+            # 조용히 무시됨. (2) 그 뒤에 다시 부른 update_matrix(b, True)가
+            # rotation_quaternion을 전혀 읽지 않고 b.wiggle.position만으로
+            # 행렬을 다시 계산해서, 방금 블렌드한 값을 곧바로 덮어써버렸음
+            # (QUATERNION 모드여도 무효). matrix_basis에서 실제 시뮬레이션
+            # 회전을 읽어 블렌드하고, 본의 실제 rotation_mode에 맞는 채널에
+            # 써서 두 문제를 모두 해결. 이후 update_matrix()는 다시 부르지
+            # 않음(부르면 방금 쓴 채널을 무시하고 물리 상태로 또 덮어씀).
+            sim_q = b.matrix_basis.to_quaternion()
+            anim_q = orig_rots.get(b.name, Quaternion((1, 0, 0, 0)))
+
+            # [버그 수정] 회전만 블렌드하고 위치는 그대로 뒀던 문제.
+            # wiggle_head가 플로팅(use_connect 아님)인 본은 update_matrix()가
+            # b.location도 물리 위치로 직접 써버리는데, 회전만 애니메이션
+            # 쪽으로 되돌려도 위치는 여전히 물리 결과에 남아있어서 influence
+            # 를 0으로 내려도 본이 코일처럼 튀어나온 채로 남아있었음. 위치도
+            # 똑같이 애니메이션 원본 쪽으로 되돌림.
+            sim_loc = b.location.copy()
+            anim_loc = orig_locs.get(b.name, sim_loc)
+            sim_scale = b.scale.copy()
+            anim_scale = orig_scales.get(b.name, sim_scale)
+
+            # Sim Mix Layers가 실제 프레임을 바꾸지 않고도(슬라이더만
+            # 만졌을 때) 새 influence로 즉시 다시 블렌드할 수 있도록, inf
+            # 값과 무관하게 이번 프레임의 순수 애니메이션/시뮬레이션
+            # 회전·위치·스케일을 항상 캐시해둔다.
+            _LAST_BLEND_CACHE[(ob.name, b.name)] = (
+                anim_q.copy(), sim_q.copy(), b.rotation_mode,
+                anim_loc.copy(), sim_loc.copy(),
+                anim_scale.copy(), sim_scale.copy(),
+            )
+
             if inf < 1.0:
-                sim_q = b.rotation_quaternion.copy()
-                anim_q = orig_rots.get(b.name, Quaternion((1,0,0,0)))
-                b.rotation_quaternion = anim_q.slerp(sim_q, inf)
-                update_matrix(b, True)
+                blended_q = anim_q.slerp(sim_q, inf)
+                if b.rotation_mode == 'QUATERNION':
+                    b.rotation_quaternion = blended_q
+                elif b.rotation_mode == 'AXIS_ANGLE':
+                    axis, angle = blended_q.to_axis_angle()
+                    b.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
+                else:
+                    b.rotation_euler = blended_q.to_euler(b.rotation_mode)
+                b.location = anim_loc.lerp(sim_loc, inf)
+                b.scale = anim_scale.lerp(sim_scale, inf)
 
         # 5. 속도 업데이트 (원본 수치 유지: fe로 나누지 않음)
         for b in active_bones:
@@ -1372,6 +1454,8 @@ class WiggleSelect(bpy.types.Operator):
     def execute(self,context):
         bpy.ops.pose.select_all(action='DESELECT')
         rebuild = False
+        first_bone = None
+        first_ob = None
         for wo in context.scene.wiggle.list:
             ob = context.scene.objects.get(wo.name)
             if not ob:
@@ -1388,6 +1472,19 @@ class WiggleSelect(bpy.types.Operator):
                     b.select = True
                 if hasattr(b.bone, "select"):
                     b.bone.select = True
+                if first_bone is None:
+                    first_bone, first_ob = b, ob
+
+        # [버그 수정] 본들을 새로 선택만 하고 활성 본(active bone)은 전혀
+        # 안 바꿔서, 클릭하기 전에 활성 본이 우연히 위글과 무관한(예:
+        # Tail이 꺼진) 본이었으면 그 상태가 그대로 남아있었다. 그러면
+        # 속성 패널은 방금 선택한 본들이 아니라 그 옛날 활성 본의 값을
+        # 계속 보여주고, 거기서 체크박스를 누르면 update_prop()이 그 값을
+        # (진짜로) 선택된 본들 전체로 전파하면서 엉뚱한 본까지 같이
+        # 켜지는/꺼지는 결과가 났다. 방금 선택한 본 중 하나를 활성 본으로
+        # 지정해서 패널이 항상 실제로 선택된 본의 값을 보여주게 한다.
+        if first_bone is not None:
+            first_ob.data.bones.active = first_bone.bone
 
         if rebuild: build_list()
         return {'FINISHED'}
@@ -1825,13 +1922,9 @@ def register():
         name = 'Damp', min = 0, default = 1, override={'LIBRARY_OVERRIDABLE'},
         update=lambda s, c: update_prop(s, c, 'wiggle_damp')
     )
-    bpy.types.PoseBone.wiggle_angle_limit = bpy.props.FloatProperty(
-        name="Angle Limit",
-        description="Restrict the maximum rotation angle from the rest pose to prevent mesh distortion",
-        default=180.0,
-        min=0.0,
-        max=180.0,
-    )
+    # wiggle_angle_limit 는 ui_panel.py 에서 등록(정밀도 등 최종 정의).
+    # 여기서 중복 등록하면 등록 순서에 따라 서로 덮어써서 unregister()가
+    # 꼬일 수 있으므로 제거.
 
     bpy.types.PoseBone.wiggle_gravity = bpy.props.FloatProperty(
         name = 'Gravity', default = 1, override={'LIBRARY_OVERRIDABLE'},
@@ -1957,8 +2050,18 @@ def register():
         WiggleObject, WiggleScene, WiggleReset, WiggleCopy, WiggleSelect, WiggleBake,
         WiggleBakeCache, WiggleClearCache
     )
+    # [버그 수정] hasattr(bpy.types, cls.__name__)는 Operator/Panel 클래스가
+    # 실제로 등록됐는지 전혀 반영하지 못한다(Blender 5.x에서 실측 확인 -
+    # register_class/bpy.ops는 정상 동작하는데도 hasattr는 등록 전후 내내
+    # False). 그래서 이 가드로는 "이미 등록됨"을 절대 걸러내지 못해
+    # 재등록(Reload Scripts, 비활성화 없이 다시 활성화 등) 시
+    # "already registered" 예외가 났다. try/except로 실제 예외를 기준으로
+    # 판단해야 한다.
     for cls in classes:
-        if not hasattr(bpy.types, cls.__name__): bpy.utils.register_class(cls)
+        try:
+            bpy.utils.register_class(cls)
+        except ValueError:
+            pass
 
     bpy.types.PoseBone.wiggle = bpy.props.PointerProperty(type=WiggleBone, override={'LIBRARY_OVERRIDABLE'})
     bpy.types.Object.wiggle = bpy.props.PointerProperty(type=WiggleObject, override={'LIBRARY_OVERRIDABLE'})
@@ -1976,8 +2079,6 @@ def register():
             name="Cache Directory", subtype='DIR_PATH', default="//wiggle2_cache/"
         )
 
-    h_pre = bpy.app.handlers.frame_change_pre
-    if wiggle_pre not in h_pre: h_pre.append(wiggle_pre)
     h_post = bpy.app.handlers.frame_change_post
     if wiggle_post not in h_post: h_post.append(wiggle_post)
     h_r_pre = bpy.app.handlers.render_pre
@@ -1994,27 +2095,58 @@ def register():
     # 는 __init__.py 에서 wiggle_lattice_visual 모듈과 함께 등록됨.
 
 def unregister():
+    # [버그 수정] PointerProperty(bpy.types.*.wiggle 등)가 WiggleBone/
+    # WiggleObject/WiggleScene PropertyGroup 클래스를 참조하고 있는 동안
+    # 그 클래스를 먼저 unregister_class 하면 예외가 나서, reversed(classes)
+    # 루프가 중간에 멈춰버리고 그 뒤에 있는 클래스(WiggleToggleBBox 등)는
+    # 영원히 등록 해제되지 않는다 - 애드온을 끄고 다시 켜면(re-register)
+    # "already registered as a subclass" 오류가 남. 그래서 프로퍼티(특히
+    # PointerProperty)는 클래스를 해제하기 전에 먼저 지워야 한다.
+    for attr in ("wiggle_cache_enable", "wiggle_cache_dir", "wiggle_enable", "wiggle"):
+        if hasattr(bpy.types.Scene, attr):
+            try: delattr(bpy.types.Scene, attr)
+            except Exception: pass
+
+    for attr in ("wiggle_self_collide", "wiggle_self_collide_margin",
+                 "wiggle_enable", "wiggle_mute", "wiggle_freeze", "wiggle"):
+        if hasattr(bpy.types.Object, attr):
+            try: delattr(bpy.types.Object, attr)
+            except Exception: pass
+
+    for attr in (
+        "wiggle_enable", "wiggle_mute", "wiggle_head", "wiggle_tail",
+        "wiggle_head_mute", "wiggle_tail_mute", "wiggle_mass", "wiggle_stiff",
+        "wiggle_stretch", "wiggle_damp", "wiggle_gravity", "wiggle_wind_ob",
+        "wiggle_wind", "wiggle_chain", "wiggle_mass_head", "wiggle_stiff_head",
+        "wiggle_stretch_head", "wiggle_damp_head", "wiggle_gravity_head",
+        "wiggle_wind_ob_head", "wiggle_wind_head", "wiggle_chain_head",
+        "wiggle_collider_type", "wiggle_collider", "wiggle_collider_collection",
+        "wiggle_radius", "wiggle_friction", "wiggle_bounce", "wiggle_sticky",
+        "wiggle_collider_type_head", "wiggle_collider_head",
+        "wiggle_collider_collection_head", "wiggle_radius_head",
+        "wiggle_friction_head", "wiggle_bounce_head", "wiggle_sticky_head",
+        "wiggle",
+    ):
+        if hasattr(bpy.types.PoseBone, attr):
+            try: delattr(bpy.types.PoseBone, attr)
+            except Exception: pass
+
     classes = (
         WiggleToggleBBox, WigglePreset, WiggleBoneItem, WiggleItem, WiggleBone,
         WiggleObject, WiggleScene, WiggleReset, WiggleCopy, WiggleSelect, WiggleBake,
         WiggleBakeCache, WiggleClearCache
     )
+    # [버그 수정] register()와 같은 이유로 hasattr 가드를 제거하고
+    # try/except로 바꾼다 - hasattr(bpy.types, cls.__name__)가 항상 False라
+    # 이 가드로는 unregister_class가 사실상 한 번도 호출되지 않고 있었다.
     for cls in reversed(classes):
-        if hasattr(bpy.types, cls.__name__): bpy.utils.unregister_class(cls)
-    
-    if wiggle_pre in bpy.app.handlers.frame_change_pre: bpy.app.handlers.frame_change_pre.remove(wiggle_pre)
+        try:
+            bpy.utils.unregister_class(cls)
+        except (RuntimeError, ValueError):
+            pass
+
     if wiggle_post in bpy.app.handlers.frame_change_post: bpy.app.handlers.frame_change_post.remove(wiggle_post)
     if wiggle_render_pre in bpy.app.handlers.render_pre: bpy.app.handlers.render_pre.remove(wiggle_render_pre)
     if wiggle_render_post in bpy.app.handlers.render_post: bpy.app.handlers.render_post.remove(wiggle_render_post)
     if wiggle_render_cancel in bpy.app.handlers.render_cancel: bpy.app.handlers.render_cancel.remove(wiggle_render_cancel)
     if wiggle_load in bpy.app.handlers.load_post: bpy.app.handlers.load_post.remove(wiggle_load)
-
-    for attr in ("wiggle_cache_enable", "wiggle_cache_dir"):
-        if hasattr(bpy.types.Scene, attr):
-            try: delattr(bpy.types.Scene, attr)
-            except Exception: pass
-
-    for attr in ("wiggle_self_collide", "wiggle_self_collide_margin"):
-        if hasattr(bpy.types.Object, attr):
-            try: delattr(bpy.types.Object, attr)
-            except Exception: pass

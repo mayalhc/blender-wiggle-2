@@ -15,6 +15,20 @@
 
 ---
 
+## 🆕 What's New in v2.2.7
+
+A maintenance release focused on **addon lifecycle stability** and **Bake Result C safety**, plus a full audit pass across the codebase to remove leftover debug output and dead code.
+
+*   **Fixed: Disabling/re-enabling the addon (or Reload Scripts) could fail.** A version-compatibility issue in how operators/panels checked their own registration state meant that, on Blender 5.x, turning the addon off and back on — or using Blender's "Reload Scripts" — could throw "already registered as a subclass" errors and leave menus/panels in a broken state. Registration now uses proper error handling instead of an unreliable check, so enable/disable/reload cycles are clean.
+*   **Fixed: Bake Result C could overwrite your live Sim layer.** Baking used to write directly into the currently selected Sim layer's action. If that layer was still receiving new keyframes (or you baked twice), the bake could stomp on data you wanted to keep. **Bake Result C now always creates a brand-new Sim layer + action for its result** (named "Bake", "Bake 2", ...) and adds it straight into Sim Mix Layers, fully selected and ready to blend — your existing layers are never touched.
+*   **Fixed: A rare double-action bug during Bake Result C.** In some cases a single bake could create two action datablocks (e.g. "Bake" and "Bake.001") instead of one, due to a property-update ordering issue. Bake now creates exactly one action per bake.
+*   **Fixed: Dope Sheet action selection disappearing during playback.** Selecting a layer's action in the Dope Sheet/Action Editor and pressing Play could cause the selection to silently clear itself, traced to two separate leftover pieces of internal sync logic. Both have been removed — your action selection now survives playback.
+*   **Fixed: `Select Enabled` not updating the active bone.** Clicking Select Enabled correctly selected wiggle-enabled bones, but left the properties panel showing a stale bone's settings, which could cause the next checkbox edit to apply to the wrong bone. The active bone is now updated to a genuinely-selected wiggle bone.
+*   **Fixed: Angle Limit precision bug.** A duplicate/conflicting property definition for Total Limit between two files has been cleaned up to a single source of truth.
+*   **Cleanup**: Removed a per-frame handler that did nothing but walk every armature and bone in the scene every frame (dead code, no behavior change). Removed leftover debug console print statements (Horizontal Lattice rebuild logging). `unregister()` now properly cleans up all custom properties this addon adds to Scene/Object/Bone, so disabling the addon leaves no residue.
+
+---
+
 ## 🆕 What's New in v2.2.6
 
 This update is focused entirely on **stability and reliability**. A full pass was made through every setting in the UI to make sure each slider and toggle actually does what its label says — several controls that looked correct in the panel but silently did nothing (or did the wrong thing) have been fixed. No workflow changes are required; your existing rigs and settings will simply behave more correctly after updating.
@@ -56,7 +70,7 @@ Together, they form a "Zero-Waste" ecosystem—from initial strand creation to t
 
 ---
 
-## 📖 User Guide: Wiggle 2 Physics v2.2.6
+## 📖 User Guide: Wiggle 2 Physics v2.2.7
 
 ### Step 1: Initializing your Physics Stack
 To begin using Wiggle 2 RTX, you must first define your animation and simulation layers. The system will not calculate physics until these layers are initialized.
@@ -107,7 +121,8 @@ This core feature handles keyframes (animation) and simulation (physics) as a si
 ![Sim Mix Layers UI](assets/image.png)
 
 *   **Bake Result C (Composite Bake)**: Merges keyframes and simulation into a single keyframe track while preserving the exact layer mix weights.
-*   **Non-destructive workflow**: Keeps `Base_Anim` untouched while cleanly extracting only the simulated result.
+*   **v2.2.7 change**: Bake Result C no longer bakes into your currently selected Sim layer. Every bake now creates a **new Sim layer** (named "Bake", "Bake 2", ...) with its own new action, added to the Sim Mix Layers list and auto-selected. This means baking is always non-destructive to your existing Sim layers, and you can bake the same range multiple times (e.g. to compare variations) without losing earlier results — just delete layers you don't want to keep.
+*   **Non-destructive workflow**: Keeps `Base_Anim` (and every existing Sim layer) untouched while cleanly extracting only the simulated result into its own layer.
 *   **Game-engine friendly**: Flattens the animation so Unity/Unreal playback matches the Blender viewport 100%.
 
 <video width="100%" controls>

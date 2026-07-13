@@ -115,8 +115,6 @@ class WiggleRTXHorizontalEngine:
                     if tail_dist < 5.0:
                         self.tail_pairs.append((bone_A.name, bone_B.name, tail_dist))
 
-        print(f"[Wiggle RTX] Build completed: Cached {len(self.tail_pairs)} horizontal links.")
-
     def _mesh_name(self):
         # [버그 수정] 이름이 "Lattice_Mesh"로 고정이라 아마추어가 두 개 이상일 때
         # 서로의 메쉬/엔진 데이터를 덮어썼음. 아마추어 이름을 포함해 유일하게 만듦.
@@ -403,7 +401,10 @@ def auto_start_lattice_on_load(dummy):
             pass
 
 def register():
-    bpy.utils.register_class(WiggleRTX_ModalVisualOperator)
+    try:
+        bpy.utils.register_class(WiggleRTX_ModalVisualOperator)
+    except ValueError:
+        pass
     if auto_start_lattice_on_load not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(auto_start_lattice_on_load)
 
@@ -433,7 +434,10 @@ def register():
 def unregister():
     if auto_start_lattice_on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(auto_start_lattice_on_load)
-    bpy.utils.unregister_class(WiggleRTX_ModalVisualOperator)
+    try:
+        bpy.utils.unregister_class(WiggleRTX_ModalVisualOperator)
+    except (RuntimeError, ValueError):
+        pass
 
     for attr in ("wiggle_is_collider", "wiggle_collider_radius"):
         if hasattr(bpy.types.PoseBone, attr):

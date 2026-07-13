@@ -131,7 +131,15 @@ class WIGGLE_PT_SimMixLayer_v3(bpy.types.Panel):
             # 레이어 타입 선택
             row = box.row(align=True)
             row.prop(active_layer, "type", expand=True)
-            
+
+            # 모든 Sim 레이어(mute 아닌)의 Layer Weight × Sim Mix를 합산한
+            # 최종 실시간 물리 강도를 보여줌 (0=애니메이션만, 1=물리 100%).
+            if obj.type == 'ARMATURE' and hasattr(obj, "wiggle_layers") and obj.wiggle_layers:
+                pb_dbg = next((pb for pb in obj.pose.bones
+                               if getattr(pb, "wiggle_tail", False) or getattr(pb, "wiggle_head", False)), None)
+                if pb_dbg:
+                    box.label(text=f"Live physics strength = {pb_dbg.wiggle_influence:.3f}", icon='INFO')
+
             # 3. 최종 베이크 버튼
             layout.separator()
             row = layout.row()
@@ -148,34 +156,34 @@ class WIGGLE_PT_SimMixLayer_v3(bpy.types.Panel):
 # 이 오퍼레이터는 별도의 파일이나 wiggle_2.py의 register 부분에 있어야 합니다.
 # ----------------------------------------------------------------
 class WIGGLE_OT_ApplyMixToChain(bpy.types.Operator):
-    """활성 Sim Mix 레이어의 Sim Mix 값을 이 오브젝트의 모든 위글 본에 즉시 적용합니다"""
+    """모든 Sim Mix 레이어(Layer Weight x Sim Mix)를 합산해 이 오브젝트의
+    모든 위글 본에 즉시 다시 적용하고, 타임라인을 안 건드리고도 뷰포트를
+    새 값으로 갱신합니다."""
     bl_idname = "wiggle.apply_mix_to_chain"
-    bl_label = "Apply Mix to Chain"
+    bl_label = "Refresh Physics Mix"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         obj = context.object
         if not obj or not hasattr(obj, "wiggle_layers"):
             return {'CANCELLED'}
-        idx = getattr(obj, "wiggle_layer_index", -1)
-        if not (0 <= idx < len(obj.wiggle_layers)):
-            self.report({'WARNING'}, "No active Sim Mix layer.")
-            return {'CANCELLED'}
 
-        # [버그 수정] 이 버튼이 active_layer.sim_mix 슬라이더 바로 옆에 있는데
-        # 실제로는 엉뚱하게 pb.wiggle_influence(활성 본의 개별 값)를 자식들에게
-        # 복사하고 있었음. 버튼 위치와 일치하도록 레이어의 sim_mix 값을 이
-        # 오브젝트의 모든 위글 본에 적용하도록 수정.
-        target_val = obj.wiggle_layers[idx].sim_mix
-        count = 0
-        for pb in obj.pose.bones:
-            if getattr(pb, "wiggle_tail", False) or getattr(pb, "wiggle_head", False):
-                pb.wiggle_influence = target_val
-                count += 1
+        from . import wiggle_layers as _wl
+        if not obj.wiggle_layers:
+            self.report({'WARNING'}, "No Sim Mix layers on this object.")
+            return {'CANCELLED'}
+        weight = _wl.sync_layers(obj)
+
+        try:
+            from . import wiggle_2
+            wiggle_2.build_list()
+            wiggle_2.refresh_influence_blend(obj)
+        except Exception:
+            pass
 
         if context.area:
             context.area.tag_redraw()
-        self.report({'INFO'}, f"Sim Mix {target_val:.2f} applied to {count} bone(s).")
+        self.report({'INFO'}, f"Combined physics strength {weight:.2f} applied.")
         return {'FINISHED'}
 
 
@@ -440,11 +448,17 @@ classes = (
 def register():
     # 1. 클래스 등록
     for cls in classes:
+        # [버그 수정] hasattr(bpy.types, cls.__name__)로 "이미 등록됐는지"를
+        # 가리려 했지만, Blender 5.x에서 실측한 결과 Operator/Panel
+        # 클래스는 실제 등록 여부와 무관하게 이 hasattr가 항상 False다
+        # (register_class/bpy.ops 자체는 정상 동작). 그래서 이 가드는
+        # 아무 역할도 못 했고, 재등록(Reload Scripts 등) 시
+        # "already registered" 예외만 만들었다. try/except로 실제 예외
+        # 발생 여부를 기준으로 판단한다.
         try:
-            if not hasattr(bpy.types, cls.bl_idname if hasattr(cls, 'bl_idname') else cls.__name__):
-                bpy.utils.register_class(cls)
-        except RuntimeError as e:
-            print(f"Wiggle 2 Registration Error ({cls.__name__}): {e}")
+            bpy.utils.register_class(cls)
+        except (RuntimeError, ValueError) as e:
+            pass
 
     # 2. 씬(Scene) 단위 속성 등록
     bpy.types.Scene.wiggle_adaptive_damping = bpy.props.BoolProperty(
@@ -493,9 +507,16 @@ def register():
 
 def unregister():
     # 1. 클래스 해제
+    # [버그 수정] hasattr(bpy.types, cls.__name__) 가드는 Blender 5.x에서
+    # Operator/Panel 클래스의 실제 등록 여부를 전혀 반영하지 못해서(항상
+    # False), 이 오퍼레이터/패널이 실제로는 unregister_class 되지 않고
+    # 계속 남아있었다. 애드온을 껐다 켜면 "already registered as a
+    # subclass"로 재등록이 실패하는 원인. try/except로 바꾼다.
     for cls in reversed(classes):
-        if hasattr(bpy.types, cls.bl_idname if hasattr(cls, 'bl_idname') else cls.__name__):
+        try:
             bpy.utils.unregister_class(cls)
+        except (RuntimeError, ValueError):
+            pass
 
     # 2. 씬 속성 삭제
     props_scene = [
