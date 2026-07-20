@@ -20,17 +20,17 @@ def reset_scene():
 def reset_ob(ob):
     if not ob:
         return
-    # 1. 해당 오브젝트의 위글 데이터를 가져옴
+    # 1. Fetch the wiggle data for this object
     wo = bpy.context.scene.wiggle.list.get(ob.name)
 
-    # 2. 데이터가 존재하는지(None이 아닌지) 먼저 확인
+    # 2. Make sure the data actually exists (is not None) first
     if wo and hasattr(wo, 'list'):
         arm_obj = bpy.data.objects.get(wo.name)
         if arm_obj and arm_obj.pose:
             bones = [arm_obj.pose.bones.get(wb.name) for wb in wo.list]
             reset_bones_batch(bones)
     else:
-        # 데이터가 없으면 에러 없이 조용히 넘어감
+        # No data - silently skip without erroring
         pass
 
 
@@ -49,37 +49,37 @@ def reset_bones_batch(bones):
         return
     clear_parent_cache()
 
-    # 1. 모든 본의 시각적 포즈를 원래 자리로 리셋
+    # 1. Reset every bone's visual pose back to its rest position
     for b in bones:
         b.matrix_basis = Matrix.Identity(4)
         b.id_data.update_tag()
 
-    # 2. 전체 배치에 대해 딱 한 번만 월드 행렬 재계산
-    #    (본 개수만큼 반복 호출하면 그만큼 전체 뎁스그래프를 다시 평가해서
-    #    본이 많은 리그에서 매우 느려짐)
+    # 2. Recompute world matrices exactly once for the whole batch
+    #    (calling this once per bone would re-evaluate the entire depsgraph
+    #    that many times, which gets very slow on rigs with many bones)
     bpy.context.view_layer.update()
 
     zero_v = Vector((0, 0, 0))
     for b in bones:
-        # 3. 업데이트된 본의 실제 월드 위치 확보
+        # 3. Grab each bone's now-updated real world position
         world_mat = b.id_data.matrix_world
         current_world_matrix = world_mat @ b.matrix
 
-        # 4. 물리 좌표를 현재 본의 '실제 월드 좌표'로 완벽 동기화
+        # 4. Fully sync the physics coordinates to the bone's actual world position
         curr_tail_pos = (world_mat @ b.matrix @ Matrix.Translation(Vector((0, b.bone.length, 0)))).translation
         curr_head_pos = current_world_matrix.translation
 
-        # 5. 가속도와 속도를 0으로 완전히 죽임 (날아가는 것 방지)
+        # 5. Completely zero out acceleration and velocity (prevents flying off)
         b.wiggle.position = b.wiggle.position_last = curr_tail_pos
         b.wiggle.position_head = b.wiggle.position_last_head = curr_head_pos
 
         b.wiggle.velocity = b.wiggle.velocity_head = zero_v
         b.wiggle.collision_normal = b.wiggle.collision_normal_head = zero_v
 
-        # 6. 물리 연산용 행렬 데이터도 현재 리셋된 값으로 덮어씀
+        # 6. Overwrite the physics matrix data with the freshly reset values too
         b.wiggle.matrix = flatten(current_world_matrix)
 
-        # 7. 마지막으로 update_matrix를 호출하여 연산 준비 완료
+        # 7. Finally call update_matrix to finish preparing for simulation
         update_matrix(b, last=True)
 
 
@@ -111,7 +111,7 @@ def build_list():
 
 
 def update_prop(self, context, prop):
-    """선택된 포즈본에 같은 값을 전파. b[prop] 방식 제거 → setattr 통일."""
+    """Propagate the same value to selected pose bones. Dropped the b[prop] approach in favor of setattr for consistency."""
     if context.scene.get("wiggle_updating"):
         return
     val = getattr(self, prop)
@@ -119,15 +119,17 @@ def update_prop(self, context, prop):
     try:
         if isinstance(self, bpy.types.PoseBone):
             selected = list(getattr(context, "selected_pose_bones", None) or [])
-            # [버그 수정] "b is self"(정체성 비교)를 썼는데, Blender는
-            # context.selected_pose_bones로 얻은 본과 update 콜백의 self가
-            # 같은 본이어도 서로 다른 Python 래퍼 객체일 수 있다(다른
-            # NLA/PropertyGroup 관련 코드에서도 같은 문제를 발견/수정함).
-            # 그러면 "이미 값이 설정된 self"를 못 알아보고 다시
-            # setattr해서 자기 자신에게 여러 본 선택 시 예상 못 한 순서로
-            # 값이 되돌아오거나, reset_bone()이 활성 본에는 절대 안 불리는
-            # 등 본마다 결과가 달라 보이는 문제가 있었다. 이름 비교로
-            # 바꾼다.
+            # [Bug fix] This used to compare identity ("b is self"), but Blender
+            # can hand back a different Python wrapper object for the same
+            # bone between context.selected_pose_bones and the update
+            # callback's self (the same issue was found/fixed in other
+            # NLA/PropertyGroup-related code). That meant "self, which
+            # already has the value set" wasn't recognized, so it got
+            # setattr'd again - with multiple bones selected this produced
+            # unpredictable ordering where values snapped back, or
+            # reset_bone() never being called on the active bone, so the
+            # result looked different from bone to bone. Switched to a
+            # name comparison instead.
             for b in selected:
                 if b.name == self.name:
                     continue
@@ -153,20 +155,21 @@ def update_prop(self, context, prop):
 
 _GET_PARENT_CACHE = {}
 
-# Sim Mix Layers의 Layer Weight/Sim Mix 슬라이더가 실제 프레임을 바꾸지
-# 않고도 즉시 미리보기를 갱신할 수 있도록, 마지막 실제 프레임에서 계산된
-# (애니메이션 회전, 시뮬레이션 회전, rotation_mode, 애니메이션 위치, 시뮬
-# 레이션 위치)를 본별로 저장해둔다. 키: (오브젝트 이름, 본 이름).
-# refresh_influence_blend()에서 소비.
+# So the Sim Mix Layers' Layer Weight/Sim Mix sliders can refresh the preview
+# instantly without actually changing the current frame, this stores, per
+# bone, the (animation rotation, simulation rotation, rotation_mode,
+# animation position, simulation position) computed on the last real frame.
+# Key: (object name, bone name). Consumed by refresh_influence_blend().
 _LAST_BLEND_CACHE = {}
 
 
 def refresh_influence_blend(obj):
-    """실제 프레임을 바꾸지 않고(=물리를 다시 계산하지 않고), 마지막으로
-    계산된 애니메이션/시뮬레이션 포즈를 현재 wiggle_influence 값으로 다시
-    블렌드해서 뷰포트에 즉시 반영한다. Sim Mix Layers의 Layer Weight/Sim
-    Mix 슬라이더를 움직였을 때(타임라인은 그대로) 호출한다. 물리나 프레임을
-    건드리지 않으므로 리셋/속도 손실 같은 부작용이 전혀 없다."""
+    """Without changing the current frame (i.e. without recomputing physics),
+    re-blend the last-computed animation/simulation pose using the current
+    wiggle_influence value and apply it to the viewport immediately. Called
+    when the Sim Mix Layers' Layer Weight/Sim Mix slider is moved (the
+    timeline stays put). Since it never touches physics or the frame, there
+    are no side effects like resets or lost velocity."""
     if not obj or obj.type != 'ARMATURE':
         return
     changed = False
@@ -192,10 +195,11 @@ def refresh_influence_blend(obj):
 
 
 def clear_parent_cache():
-    """get_parent()의 결과는 한 프레임 안에서는 절대 바뀌지 않는데(같은 프레임
-    안에서 wiggle_tail/head/mute가 바뀔 일이 없음), constrain()이 본마다
-    iterations번씩 호출되면서 매번 부모 체인을 다시 타고 올라가 재계산하고
-    있었음. 프레임 시작 시점에 캐시를 비우고, 그 프레임 안에서는 재사용."""
+    """get_parent()'s result can never change within a single frame (wiggle_tail/
+    head/mute don't change mid-frame), but constrain() was calling it
+    `iterations` times per bone and walking back up the parent chain to
+    recompute every time. Clear the cache at the start of each frame and
+    reuse it for the rest of that frame."""
     _GET_PARENT_CACHE.clear()
 
 def get_parent(b):
@@ -215,8 +219,9 @@ def length_world(b):
     return (b.id_data.matrix_world @ b.head - b.id_data.matrix_world @ b.tail).length
 
 def collider_poll(self, object):
-    # 애널리틱 프리미티브(Sphere/Box/Cylinder/Capsule) 모드에서는 메쉬가 필요
-    # 없으므로 어떤 오브젝트든(Empty 포함) 트랜스폼 참조로 쓸 수 있게 허용.
+    # In analytic primitive (Sphere/Box/Cylinder/Capsule) mode no mesh is
+    # needed, so allow any object (including Empties) to be used as a
+    # transform reference.
     ctype = getattr(self, "wiggle_collider_type", 'Object')
     if ctype in PRIMITIVE_COLLIDERS:
         return True
@@ -225,13 +230,13 @@ def collider_poll(self, object):
 WIND_FIELD_TYPES = {'WIND', 'TURBULENCE', 'VORTEX'}
 
 def wind_poll(self, object):
-    # [기능 확장] 원래 WIND 타입만 허용했음. Turbulence/Vortex도 지원.
+    # [Feature extension] Originally only the WIND type was allowed. Now Turbulence/Vortex are also supported.
     return object.field and object.field.type in WIND_FIELD_TYPES
 
 
 def compute_wind_force(wind_ob, pos, ref_dir, mass, wind_mult):
-    """wind_ob의 Force Field 타입(Wind/Turbulence/Vortex)에 따라 실제 힘을 계산.
-    mass로 나눈 가속도 형태로 반환 (F/mass), 호출부에서 바로 dt^2와 곱해 쓰면 됨."""
+    """Computes the actual force based on wind_ob's Force Field type (Wind/Turbulence/Vortex).
+    Returned as acceleration (i.e. divided by mass, F/mass) so the caller can multiply by dt^2 directly."""
     field = wind_ob.field
     if not field:
         return Vector((0, 0, 0))
@@ -246,8 +251,9 @@ def compute_wind_force(wind_ob, pos, ref_dir, mass, wind_mult):
     elif field.type == 'TURBULENCE':
         size = max(getattr(field, 'size', 1.0), 0.0001)
         freq = 1.0 / size
-        # 4D 노이즈가 없으므로 프레임 번호로 Z축을 오프셋시켜 정지된 본도
-        # 시간에 따라 힘이 흔들리도록 근사함 (실제 Turbulence 필드처럼).
+        # There's no 4D noise available, so offset the Z axis by the frame
+        # number as an approximation, letting the force fluctuate over time
+        # even for a stationary bone (mimicking a real Turbulence field).
         frame = bpy.context.scene.frame_current
         sample_pos = pos * freq + Vector((0.0, 0.0, frame * 0.1))
         noise_vec = noise.noise_vector(sample_pos)
@@ -273,15 +279,18 @@ def compute_wind_force(wind_ob, pos, ref_dir, mass, wind_mult):
 
 
 # ============================================================
-# 애널리틱 프리미티브 콜라이더 (Sphere/Box/Cylinder/Capsule)
-# 메쉬 없이 오브젝트의 트랜스폼(위치/회전/스케일)만으로 충돌 판정.
-# 전부 "단위 프리미티브"를 기준으로 계산하고 오브젝트 스케일로 실제 크기를
-# 조절하는 방식 (Blender 기본 프리미티브와 동일한 크기 컨벤션):
-#   Sphere   : 반지름 1
-#   Box      : 반높이(half-extent) 1 (기본 Cube, 2x2x2)
-#   Cylinder : 반지름 1, 반높이 1, Z축 방향 (기본 Cylinder, 반지름1 높이2)
-#   Capsule  : 반지름 1, 몸통 반높이 1, Z축 방향
-# 각 함수는 오브젝트 로컬 스페이스의 점을 받아 (로컬 최근접점, 로컬 노멀)을 반환.
+# Analytic primitive colliders (Sphere/Box/Cylinder/Capsule)
+# Collision is determined purely from the object's transform (position/
+# rotation/scale), with no mesh involved.
+# Everything is computed against a "unit primitive" and the object scale
+# provides the actual size (matching Blender's default primitive size
+# conventions):
+#   Sphere   : radius 1
+#   Box      : half-extent 1 (default Cube, 2x2x2)
+#   Cylinder : radius 1, half-height 1, along Z axis (default Cylinder, radius 1 height 2)
+#   Capsule  : radius 1, body half-height 1, along Z axis
+# Each function takes a point in the object's local space and returns
+# (local closest point, local normal).
 # ============================================================
 
 def _closest_point_sphere(lp):
@@ -297,7 +306,7 @@ def _closest_point_box(lp):
     cz = max(-1.0, min(1.0, lp.z))
     inside = abs(lp.x) <= 1.0 and abs(lp.y) <= 1.0 and abs(lp.z) <= 1.0
     if inside:
-        # 안에 있으면 가장 가까운 면으로 밀어냄
+        # If inside, push out toward the nearest face
         faces = [
             (1.0 - abs(lp.x), Vector((1.0 if lp.x >= 0 else -1.0, 0.0, 0.0))),
             (1.0 - abs(lp.y), Vector((0.0, 1.0 if lp.y >= 0 else -1.0, 0.0))),
@@ -358,21 +367,26 @@ PRIMITIVE_COLLIDERS = {
 
 
 # ============================================================
-# 셀프 콜리전 (opt-in, 오브젝트 단위) - 진짜 캡슐(선분)-캡슐 충돌.
-# 각 wiggle_tail 본을 head-tail 선분(반지름 wiggle_radius)으로 보고
-# 표준 "두 3D 선분 사이 최근접점" 알고리즘으로 실제 거리를 계산함
-# (Ericson, Real-Time Collision Detection). 점 기반보다 정확 - 예를 들어
-# 두 본의 중간 부분끼리 스치듯 지나가는 경우도 잡아냄.
-# 직접 이어진 부모-자식 쌍은 원래 붙어있어야 하므로 검사에서 제외 - 안
-# 그러면 stiffness/stretch 제약과 계속 싸워서 떨림이 생김.
-# 프레임당 정확히 한 번만 적용(반복마다 X)해서 진동 위험을 최소화함.
-# 참고: wiggle_head만 켜져 있고 wiggle_tail은 꺼진 "떠 있는 점" 본은
-# 선분을 이룰 수 없어 이 검사에서 제외됨 (드문 케이스).
+# Self collision (opt-in, per object) - true capsule(segment)-capsule collision.
+# Each wiggle_tail bone is treated as a head-tail segment (radius
+# wiggle_radius), and the actual distance is computed with the standard
+# "closest point between two 3D segments" algorithm (Ericson, Real-Time
+# Collision Detection). More accurate than a point-based check - for
+# example it also catches two bones grazing past each other in their
+# middle sections.
+# Directly-connected parent-child pairs are excluded from the check since
+# they're meant to be touching - otherwise they'd constantly fight the
+# stiffness/stretch constraints and cause jitter.
+# Applied exactly once per frame (not per iteration) to minimize
+# oscillation risk.
+# Note: a "floating point" bone with only wiggle_head enabled and
+# wiggle_tail off can't form a segment, so it's excluded from this check
+# (a rare case).
 # ============================================================
 
 def _closest_seg_seg(p1, q1, p2, q2):
-    """두 3D 선분(p1-q1, p2-q2) 사이의 최근접점 쌍과 파라미터(s,t, 0=시작점
-    1=끝점)를 반환. 표준 알고리즘."""
+    """Returns the closest point pair and parameters (s,t, 0=start point,
+    1=end point) between two 3D segments (p1-q1, p2-q2). Standard algorithm."""
     d1 = q1 - p1
     d2 = q2 - p2
     r = p1 - p2
@@ -409,8 +423,9 @@ def _closest_seg_seg(p1, q1, p2, q2):
 
 
 def _capsule_endpoints(b):
-    """본을 캡슐(선분)로 볼 때의 head/tail 월드 좌표. wf_head가 켜져 있으면
-    시뮬레이션된 헤드 위치, 아니면 현재 애니메이션된(고정된) 헤드 위치."""
+    """World-space head/tail coordinates when treating the bone as a
+    capsule (segment). If wiggle_head is on, uses the simulated head
+    position; otherwise uses the current animated (fixed) head position."""
     tail = b.wiggle.position
     if b.wiggle_head and not b.bone.use_connect:
         head = b.wiggle.position_head
@@ -425,7 +440,7 @@ def apply_self_collision(active_bones, margin=0.0):
     if n < 2:
         return
 
-    # 직접 이어진 (부모-자식) 본 쌍은 건너뛸 목록 미리 계산
+    # Precompute the set of directly-connected (parent-child) bone pairs to skip
     adjacent = set()
     for b in active_bones:
         p = get_parent(b)
@@ -457,9 +472,10 @@ def apply_self_collision(active_bones, margin=0.0):
 
             push = diff.normalized() * ((min_dist - dist) * 0.5)
 
-            # s/t: 0=head쪽, 1=tail쪽 - 충돌이 일어난 쪽 끝점을 그 비중만큼 밀어냄.
-            # head가 애니메이션 고정(비-floating)이면 이동시킬 수 없으므로
-            # 전량 tail로 보정함.
+            # s/t: 0=head side, 1=tail side - push the endpoint on the colliding
+            # side by that proportion. If head is animation-fixed
+            # (non-floating) it can't be moved, so apply the full correction
+            # to tail instead.
             if floating1:
                 b1.wiggle.position_head -= push * (1.0 - s)
                 b1.wiggle.position -= push * s
@@ -543,9 +559,11 @@ def collide(b,dg,head=False,register_bounce=False):
                 nv = -v.normalized()
             pos = i + nv*radius
 
-            # [버그 수정] bounce/vel이 추출만 되고 한 번도 쓰인 적이 없어서
-            # "Bounce" 설정이 처음부터 아무 효과가 없었음. 충돌 노멀 방향
-            # 속도 성분을 실제로 반사시켜줌 (튕기는 만큼 bounce로 조절).
+            # [Bug fix] bounce/vel were only ever extracted and never used,
+            # so the "Bounce" setting had no effect at all from the start.
+            # Now the velocity component along the collision normal is
+            # actually reflected (the amount of bounce is controlled by the
+            # bounce value).
             vel_along_normal = vel.dot(nv)
             if vel_along_normal < 0:
                 vel = vel - nv * (vel_along_normal * (1.0 + bounce))
@@ -572,13 +590,16 @@ def collide(b,dg,head=False,register_bounce=False):
         b.wiggle.collision_ob = co
         b.wiggle.collision_normal = cn
 
-    # [버그 수정 계속] 이 시스템은 속도를 매 프레임 끝에서 position과
-    # position_last의 차이로 다시 계산하기 때문에(verlet 방식), vel을 직접
-    # 바꿔도 프레임이 끝나면 그대로 덮어써져서 아무 효과가 없었음. 실제로
-    # 반사가 다음 프레임까지 이어지려면 position_last를 같이 조정해야 함.
-    # move()에서 호출할 때만(register_bounce=True) 적용 - constrain()의
-    # 반복 보정 호출까지 매번 적용하면 매 iteration마다 반사가 겹쳐 계산돼
-    # 불안정해질 수 있어서 프레임당 진짜 충돌 1회(move 단계)에서만 반영.
+    # [Bug fix, continued] Because this system recomputes velocity at the
+    # end of every frame from the difference between position and
+    # position_last (verlet-style), directly changing vel got overwritten
+    # by the end of the frame and had no effect. For the reflection to
+    # actually carry into the next frame, position_last needs to be
+    # adjusted too. Only applied when called from move() (register_bounce=
+    # True) - if this were also applied on every constrain() iteration call,
+    # the reflection would stack up each iteration and could become
+    # unstable, so it's only reflected once per frame, at the real
+    # collision (move step).
     if register_bounce and col:
         if head:
             b.wiggle.position_last_head = pos - vel
@@ -597,7 +618,7 @@ def update_matrix(b, last=False):
             diff = relative_matrix(p.matrix, b.matrix)
             lo = Matrix.Translation((p.wiggle.matrix @ diff).translation)
             ro = p.wiggle.matrix.to_quaternion().to_matrix().to_4x4() @ diff.to_quaternion().to_matrix().to_4x4()
-            # 5.0 대응: 스케일 오염 방지
+            # Blender 5.0 compatibility: prevent scale contamination
             sc_vec = (b.id_data.matrix_world @ b.matrix).decompose()[2]
             sc = Matrix.LocRotScale(None, None, sc_vec)
             m2 = lo @ ro @ sc
@@ -614,7 +635,7 @@ def update_matrix(b, last=False):
     rxz = v_rel.to_track_quat('Y','Z')
     rot = rxz.to_matrix().to_4x4()
     
-    # --- 스케일(sy) 계산 ---
+    # --- Compute scale (sy) ---
     l_world = length_world(b)
     if b.bone.inherit_scale == 'FULL':
         l0 = b.bone.length
@@ -628,7 +649,7 @@ def update_matrix(b, last=False):
                 dist = (p.wiggle.matrix @ relative_matrix(p.matrix, b.matrix).translation - b.wiggle.position).length
             sy = dist / l_world if l_world > 0.0001 else 1.0
         else:
-            # 변경 코드:
+            # Updated code:
             dist = ((b.id_data.matrix_world @ b.matrix).to_translation() - b.wiggle.position).length
             sy = dist / l_world if l_world > 0.0001 else 1.0
     
@@ -636,12 +657,13 @@ def update_matrix(b, last=False):
         dist = (b.wiggle.position_head - b.wiggle.position).length
         sy = dist / l_world if l_world > 0.0001 else 1.0
             
-    # [수정 핵심] Stretch 설정이 0(또는 매우 작음)일 때 시각적 늘어남 원천 차단
-    # 0.999~1.001 클램프 대신, Stretch를 안 쓸 거라면 무조건 1.0으로 고정합니다.
+    # [Key fix] Cut off visual stretching at the source when the Stretch
+    # setting is 0 (or very small). Instead of clamping to 0.999~1.001,
+    # just force sy to 1.0 outright whenever Stretch isn't being used.
     if hasattr(b, 'wiggle_stretch') and b.wiggle_stretch < 0.01:
         sy = 1.0
     else:
-        # Stretch를 사용할 때도 비정상적인 발산(너무 길어짐)을 막기 위한 안전장치
+        # Safety net to prevent abnormal divergence (getting too long) even when Stretch is in use
         sy = max(0.1, min(10.0, sy))
 
     scale = Matrix.Scale(sy, 4, Vector((0, 1, 0)))
@@ -656,7 +678,7 @@ def update_matrix(b, last=False):
         else:
             b.matrix = b.matrix @ loc @ rot @ scale
             
-    # 최종 행렬 정규화 및 스케일 오염 방지
+    # Normalize the final matrix and prevent scale contamination
     final_mat = m2 @ rot @ scale
     b.wiggle.matrix = flatten(final_mat)
 
@@ -674,7 +696,7 @@ def pin(b):
         if c.subtarget:
             if c.subtarget in c.target.pose.bones:
                 goal = goal @ c.target.pose.bones[c.subtarget].matrix
-        # 5.0 대응: 영향력(Influence) 계산 시 수치 안정화
+        # Blender 5.0 compatibility: numerical stability when computing Influence
         b.wiggle.position = b.wiggle.position * (1 - c.influence) + goal.translation * c.influence
 # END OF REVISION #
 
@@ -693,7 +715,7 @@ def update_visual_guide(self, context):
         new_offset = length / t
         guide_obj.scale = (t, t, t)
         
-        # 메쉬 데이터를 안전하게 업데이트하기 위한 블렌더 표준 방식
+        # Blender's standard approach for safely updating mesh data
         mesh = guide_obj.data
         is_capsule = len(mesh.vertices) > 100
         
@@ -706,13 +728,13 @@ def update_visual_guide(self, context):
                     v.co.z = new_offset
                     
         guide_obj["last_offset"] = new_offset
-        mesh.update()  # 💡 블렌더에게 메쉬가 변경되었음을 알려 화면을 갱신합니다.
+        mesh.update()  # Tell Blender the mesh has changed so the viewport refreshes
 
 # END OF REVISION #
 
 # START OF REVISION #
 
-# ====================== 1. apply_angle_limits (완전 안정 버전 - 변경 없음) ======================
+# ====================== 1. apply_angle_limits (fully stable version - unchanged) ======================
 def apply_angle_limits(b, h_pos, q_basis, rest_dir, world_rest_length):
     from math import atan2, cos, sin, radians, acos
     from mathutils import Vector, Quaternion
@@ -725,11 +747,11 @@ def apply_angle_limits(b, h_pos, q_basis, rest_dir, world_rest_length):
     if wiggle_angle_limit < 179.5:
         limit_rad = radians(wiggle_angle_limit)
         
-        # 1. 안전하게 두 벡터를 모두 정규화합니다.
+        # 1. Safely normalize both vectors.
         rest_dir_norm = rest_dir.normalized()
         curr_dir = curr_vec.normalized()
-        
-        # 2. 부동소수점 오차 방지 clamp
+
+        # 2. Clamp to avoid floating-point error
         dot = max(-1.0, min(1.0, rest_dir_norm.dot(curr_dir)))
         angle = acos(dot)
         
@@ -748,7 +770,7 @@ def apply_angle_limits(b, h_pos, q_basis, rest_dir, world_rest_length):
             curr_vec = curr_dir * world_rest_length
 
     # =========================
-    # 2. 개별 리미트 (X / Z) — Cone 이후 적용
+    # 2. Individual limits (X / Z) - applied after the Cone
     # =========================
     if getattr(b, "wiggle_use_individual_limits", False):
         local_dir = q_basis.inverted() @ curr_vec
@@ -774,13 +796,14 @@ def apply_angle_limits(b, h_pos, q_basis, rest_dir, world_rest_length):
 
 
 def reclamp_angle_limit(b):
-    """apply_angle_limits()는 move() 안에서만 호출되는데, move() 뒤에
-    돌아가는 constrain()의 반복 거리-제약 솔버는 각도 제한을 전혀 모르기
-    때문에 매 iteration마다 클램프된 위치를 다시 밖으로 끌고 나갈 수 있음
-    (예: Total Limit 10도인데 실제로는 90도까지 벌어지던 버그).
-    constrain()의 반복이 전부 끝난 뒤 프레임당 한 번, 최종 위치를 다시
-    재클램프해서 실제로 각도 제한이 지켜지게 한다. constrain() 내부 로직은
-    건드리지 않음."""
+    """apply_angle_limits() is only called from within move(), but the
+    iterative distance-constraint solver in constrain() that runs after
+    move() knows nothing about angle limits, so it can drag the clamped
+    position back out on every iteration (e.g. a bug where a Total Limit
+    of 10 degrees would actually end up spread as wide as 90 degrees).
+    This re-clamps the final position once per frame, after all of
+    constrain()'s iterations are done, so the angle limit is actually
+    respected. Does not touch constrain()'s internal logic."""
     if not b.wiggle_tail:
         return
     limit = getattr(b, "wiggle_angle_limit", 180.0)
@@ -838,7 +861,7 @@ def move(b, dg):
         return
 
     # ================================
-    # ↓↓↓ 실제 시뮬레이션 (dt > 0) ↓↓↓
+    # ↓↓↓ Actual simulation (dt > 0) ↓↓↓
     # ================================
     dt2 = dt * dt
 
@@ -857,10 +880,11 @@ def move(b, dg):
     
     h_pos_anim = m_world @ b.head
 
-    # [버그 수정] wiggle_tail_mute/wiggle_head_mute가 등록만 되고 어디서도
-    # 읽힌 적이 없어서 UI에도 없고 아무 효과가 없었음. 켜져 있으면 물리
-    # 계산을 건너뛰고 애니메이션된 레스트 위치를 그대로 따라가게 함
-    # (본 자체를 체인에서 완전히 빼는 게 아니라, 그 쪽만 힘 계산을 멈춤).
+    # [Bug fix] wiggle_tail_mute/wiggle_head_mute were only registered and
+    # never read anywhere, so they weren't even in the UI and had no
+    # effect. When enabled, physics is now skipped and the bone just
+    # follows its animated rest position (the bone isn't fully removed
+    # from the chain, only force computation on that side is stopped).
     if b.wiggle_tail and getattr(b, 'wiggle_tail_mute', False):
         h_pos = b.wiggle.position_head if (b.wiggle_head and not b.bone.use_connect) else h_pos_anim
         b.wiggle.position = h_pos + rest_dir * world_rest_length
@@ -871,9 +895,10 @@ def move(b, dg):
     elif b.wiggle_tail:
         old_pos = b.wiggle.position.copy()
 
-        # [버그 수정] adaptive_damp_mod가 매 프레임 계산만 되고 어디서도 읽히지
-        # 않아서 Safety Guard가 실제로는 항상 아무 효과가 없었음(감쇠에 전혀
-        # 반영 안 됨). 실제 감쇠 계산에 더해줌.
+        # [Bug fix] adaptive_damp_mod was computed every frame but never
+        # read anywhere, so the Safety Guard actually had no effect at all
+        # (never factored into damping). Now it's added into the actual
+        # damping calculation.
         extra_damp = getattr(b.wiggle, "adaptive_damp_mod", 0.0)
         damp = max(min(1 - (b.wiggle_damp + extra_damp) * dt, 1), 0)
         b.wiggle.velocity *= damp
@@ -913,8 +938,8 @@ def move(b, dg):
         b.wiggle.velocity_head *= damp_h
         
         F_h = bpy.context.scene.gravity * b.wiggle_gravity_head
-        # [버그 수정] wiggle_wind_ob_head/wiggle_wind_head가 등록되고 UI에도
-        # 노출돼 있었지만 여기서 한 번도 적용된 적이 없었음 (Tail 바람만 작동).
+        # [Bug fix] wiggle_wind_ob_head/wiggle_wind_head were registered and
+        # exposed in the UI, but never actually applied here (only Tail wind worked).
         if b.wiggle_wind_ob_head and b.wiggle_wind_ob_head.field:
             ref_dir_h = (b.wiggle.position_head - b.wiggle.matrix.translation)
             ref_dir_h = ref_dir_h.normalized() if ref_dir_h.length > 1e-8 else Vector((0, 0, 1))
@@ -947,10 +972,11 @@ def move(b, dg):
 
 # START OF REVISION #
 def constrain(b, i, dg, dt=None, iterations=None):
-    # [성능] dt/iterations는 프레임 안에서 불변인데 이 함수가 본마다
-    # iterations번씩 호출되면서 매번 bpy.context.scene.wiggle을 다시 읽고
-    # 있었음. 호출부(wiggle_post)에서 한 번 읽어 넘겨주면 재사용, 다른
-    # 곳에서 인자 없이 부르면 기존처럼 안전하게 폴백.
+    # [Performance] dt/iterations don't change within a frame, but this
+    # function was re-reading bpy.context.scene.wiggle every time it got
+    # called (iterations times per bone). The caller (wiggle_post) now
+    # reads it once and passes it down for reuse; if called elsewhere
+    # without arguments it still falls back safely as before.
     if dt is None:
         dt = bpy.context.scene.wiggle.dt
     if iterations is None:
@@ -991,7 +1017,7 @@ def constrain(b, i, dg, dt=None, iterations=None):
                 b.wiggle.position_head += s * (1 - fac)
             else:
                 b.wiggle.position_head += s
-            # [핵심 수정] 5.0 스케일 폭주 방지: 스케일을 무조건 (1,1,1)로 강제 고정
+            # [Key fix] Blender 5.0 scale runaway prevention: force scale to (1,1,1) unconditionally
             loc, rot, _ = mat.decompose()
             mat = Matrix.LocRotScale(b.wiggle.position_head, rot, Vector((1.0, 1.0, 1.0)))
             target = mat @ Vector((0, b.bone.length, 0))
@@ -1007,7 +1033,7 @@ def constrain(b, i, dg, dt=None, iterations=None):
             else:
                 b.wiggle.position = target
         else:
-            # [핵심 수정] b.matrix.decompose()[2] 대신 Vector((1,1,1)) 사용
+            # [Key fix] Use Vector((1,1,1)) instead of b.matrix.decompose()[2]
             loc, rot, _ = mat.decompose()
             mat = Matrix.LocRotScale(loc, rot, Vector((1.0, 1.0, 1.0)))
             target = mat @ Vector((0, b.bone.length, 0))
@@ -1030,7 +1056,7 @@ def constrain(b, i, dg, dt=None, iterations=None):
                     v1_len = v1.length
                     if v1_len > 0.0001:
                         sc = v2.length / v1_len
-                        # 찌그러짐 방지: sc(스케일)가 1에서 너무 벗어나지 않도록 클램프
+                        # Prevent squashing: clamp sc (scale) so it doesn't stray too far from 1
                         sc = max(0.99, min(1.01, sc))
                         q = v1.rotation_difference(v2)
                         v3 = q @ (p.wiggle.position - p.wiggle.matrix.translation)
@@ -1045,7 +1071,7 @@ def constrain(b, i, dg, dt=None, iterations=None):
         if b.wiggle_head and not b.bone.use_connect:
             if p:
                 if b.parent == p and p.wiggle_tail:
-                    # 길이 정규화 보강
+                    # Extra length normalization
                     v_dir = (b.wiggle.position_head - p.wiggle.position).normalized()
                     target = p.wiggle.position + v_dir * (b.id_data.matrix_world @ b.head - b.id_data.matrix_world @ p.tail).length
                 else:
@@ -1102,7 +1128,7 @@ def constrain(b, i, dg, dt=None, iterations=None):
                     v1_len = v1.length
                     if v1_len > 0.001:
                         sc = v2.length / v1_len
-                        sc = max(0.99, min(1.01, sc)) # 찌그러짐 방지
+                        sc = max(0.99, min(1.01, sc)) # Prevent squashing
                         q = v1.rotation_difference(v2)
                         v3 = q @ (p.wiggle.position - p.wiggle.matrix.translation)
                         p.wiggle.position = p.wiggle.matrix.translation + v3 * sc
@@ -1115,7 +1141,7 @@ def constrain(b, i, dg, dt=None, iterations=None):
         if update_p:
             collide(p, dg)
             update_matrix(p)
-            # 5.0 강제 정규화
+            # Blender 5.0 forced normalization
             p.matrix = p.matrix.to_3x3().normalized().to_4x4()
             p.matrix.translation = p.matrix.translation
             
@@ -1126,7 +1152,7 @@ def constrain(b, i, dg, dt=None, iterations=None):
             collide(b, dg, True)
             
     update_matrix(b)
-    # 5.0 강제 정규화
+    # Blender 5.0 forced normalization
     b.matrix = b.matrix.to_3x3().normalized().to_4x4()
     b.matrix.translation = b.matrix.translation
 # END OF REVISION #
@@ -1143,25 +1169,28 @@ def wiggle_post(scene, dg):
     if (w.lastframe == cf) and not w.reset and cf > scene.frame_start: return
     if w.reset or not scene.wiggle_enable or w.is_rendering: return
 
-    # [성능] get_parent() 결과는 프레임 안에서 불변이므로 프레임마다 한 번만
-    # 비움 - constrain()이 본마다 iterations번씩 호출하며 매번 부모 체인을
-    # 다시 타고 올라가 재계산하던 중복을 없앰.
+    # [Performance] get_parent()'s result never changes within a frame, so
+    # only clear it once per frame - removes the redundant work of
+    # constrain() walking back up the parent chain to recompute it every
+    # time it's called (iterations times per bone).
     clear_parent_cache()
 
     lastframe = w.lastframe
 
-    # [기능 수정] "Loop Physics" 토글이 (scene.wiggle.loop, scene.wiggle_use_loop)
-    # 두 개로 중복 등록돼 있었고 둘 다 실제로는 아무 데도 읽히지 않아 효과가
-    # 없었음. scene.wiggle_use_loop 하나로 통일하고 실제로 연결함: 재생 중에
-    # 타임라인이 끝에서 처음으로 자연스럽게 넘어가는 경우(진짜 루프)에만
-    # 하드 리셋을 건너뛰어 물리 상태(속도 등)가 끊기지 않고 이어지게 함.
-    # 사용자가 직접 앞으로 되감은 경우(수동 스크러빙)는 루프가 아니므로
-    # 토글과 무관하게 항상 리셋됨.
+    # [Feature fix] The "Loop Physics" toggle used to be duplicated across
+    # two properties (scene.wiggle.loop, scene.wiggle_use_loop), and
+    # neither was actually read anywhere, so it had no effect. Now unified
+    # into scene.wiggle_use_loop and actually wired up: the hard reset is
+    # only skipped when the timeline naturally wraps from the end back to
+    # the start during playback (a real loop), so the physics state
+    # (velocity, etc.) carries over uninterrupted. If the user manually
+    # rewinds forward (manual scrubbing), that's not a loop, so it always
+    # resets regardless of the toggle.
     loop_enabled = getattr(scene, "wiggle_use_loop", False)
     is_playing = bool(bpy.context.screen and bpy.context.screen.is_animation_playing)
     is_natural_loop = loop_enabled and is_playing and cf <= scene.frame_start and lastframe >= scene.frame_end
 
-    # 2. [리셋 로직] - 전체 본 순회 대신 위글 리스트 본들만 정확히 타겟팅
+    # 2. [Reset logic] - precisely target only the bones in the wiggle list, instead of iterating every bone
     if not is_natural_loop and ((cf <= scene.frame_start) or (cf < lastframe)):
         for wo in w.list:
             ob = scene.objects.get(wo.name)
@@ -1184,7 +1213,7 @@ def wiggle_post(scene, dg):
                 bw.velocity = Vector((0, 0, 0))
                 if hasattr(bw, 'q'): bw.q = Quaternion((1, 0, 0, 0))
 
-            # [수정] 전체 본 대신 리스트에 있는 본들만 업데이트하여 충돌 방지
+            # [Fix] Update only the bones in the list, not every bone, to avoid conflicts
             for wb in wo.list:
                 b = ob.pose.bones.get(wb.name)
                 if b: update_matrix(b, True)
@@ -1193,21 +1222,22 @@ def wiggle_post(scene, dg):
         w.reset = False
         return
 
-    # 3. 시간 계산 (원본 수치 유지: fe를 곱하지 않음)
+    # 3. Time calculation (keeps the original values: not multiplied by fe)
     w.dt = (1.0 / max(1.0, scene.render.fps))
     w.lastframe = cf
 
-    # 4. 메인 루프
+    # 4. Main loop
     for wo in w.list:
         ob = scene.objects.get(wo.name)
-        # [버그 수정] wiggle_freeze가 베이크 후 True로 설정되지만 여기서
-        # 한 번도 확인되지 않아서, 베이크된 키프레임 위에 물리가 계속
-        # 돌면서 결과를 덮어쓰고 있었음.
+        # [Bug fix] wiggle_freeze gets set to True after baking, but it was
+        # never checked here, so physics kept running on top of the baked
+        # keyframes and overwriting the result.
         if not ob or ob.wiggle_mute or getattr(ob, "wiggle_freeze", False): continue
 
-        # [기능 추가] 디스크 포인트 캐시 - 이미 계산된 프레임이면 재시뮬레이션
-        # 없이 그대로 불러와서 적용 (타임라인 스크러빙 시 frame_start부터
-        # 매번 다시 시뮬레이션하지 않아도 됨).
+        # [Feature added] Disk point cache - if a frame has already been
+        # computed, load and apply it directly instead of re-simulating
+        # (avoids re-simulating from frame_start every time when scrubbing
+        # the timeline).
         cache_enabled = getattr(scene, "wiggle_cache_enable", False)
         if cache_enabled and wiggle_cache.has_frame(scene, ob.name, cf):
             if wiggle_cache.load_frame(scene, ob, wo):
@@ -1217,12 +1247,12 @@ def wiggle_post(scene, dg):
                 ob.update_tag()
                 continue
 
-        # Safety Boost (아마추어 개별 계산 유지)
+        # Safety Boost (kept as a separate per-object calculation)
         safety_boost = 0.0
         if getattr(scene, "wiggle_adaptive_damping", False):
             sensitivity = getattr(scene, "wiggle_safety_threshold", 10.0)
 
-            # 1. 이동 속도 감지 (원본)
+            # 1. Detect movement speed (original)
             if not hasattr(w, "last_ob_pos"): w.last_ob_pos = {}
             current_pos = ob.matrix_world.translation.copy()
             last_pos = w.last_ob_pos.get(ob.name, current_pos)
@@ -1233,9 +1263,10 @@ def wiggle_post(scene, dg):
                 safety_boost = (obj_speed - threshold) * sensitivity
             w.last_ob_pos[ob.name] = current_pos
 
-            # 2. [추가] 회전 속도 감지 - 캐릭터가 휙 돌아설 때는 위치는 거의 안
-            # 바뀌어도 본 끝(꼬리, 머리카락)의 실제 이동 거리는 매우 커서
-            # 위치 기반 감지만으로는 못 잡음.
+            # 2. [Added] Detect rotational speed - when a character spins
+            # around quickly, position barely changes even though bone tips
+            # (tails, hair) can travel a huge actual distance, which
+            # position-based detection alone can't catch.
             if not hasattr(w, "last_ob_rot"): w.last_ob_rot = {}
             current_rot = ob.matrix_world.to_quaternion()
             last_rot = w.last_ob_rot.get(ob.name, current_rot)
@@ -1254,13 +1285,15 @@ def wiggle_post(scene, dg):
 
         orig_rots = {b.name: b.rotation_quaternion.copy() if b.rotation_mode == 'QUATERNION'
                      else b.rotation_euler.to_quaternion() for b in active_bones}
-        # [버그 수정] wiggle_influence 블렌드가 회전만 되돌리고 위치는
-        # 전혀 되돌리지 않아서, 헤드가 플로팅인(use_connect 아님) 본은
-        # influence를 0으로 내려도 물리가 옮겨놓은 위치에 그대로 남아
-        # 코일처럼 튀어나와 보이던 문제. 애니메이션 원본 위치도 함께 캐시.
+        # [Bug fix] The wiggle_influence blend only reverted rotation and
+        # never reverted position, so a floating head bone (use_connect
+        # off) would stay at wherever physics had moved it even with
+        # influence dropped to 0, sticking out like a coil. Now the
+        # original animated position is cached too.
         orig_locs = {b.name: b.location.copy() for b in active_bones}
-        # Stretch로 인한 스케일도 회전/위치와 마찬가지로 되돌려야 함
-        # (안 그러면 influence=0이어도 늘어난/찌그러진 모양이 남음).
+        # Scale caused by Stretch needs to be reverted the same way as
+        # rotation/position (otherwise a stretched/squashed shape would
+        # remain even at influence=0).
         orig_scales = {b.name: b.scale.copy() for b in active_bones}
 
         for b in active_bones:
@@ -1272,16 +1305,18 @@ def wiggle_post(scene, dg):
             for b in active_bones:
                 constrain(b, w.iterations - 1 - i, dg, w.dt, w.iterations)
 
-        # [기능 추가] 셀프 콜리전 - 기본 꺼짐, 오브젝트별 옵트인.
-        # 반복(iteration)마다가 아니라 프레임당 딱 한 번만 적용해서 기존
-        # stiffness/stretch 제약과 진동하며 싸우는 걸 방지.
+        # [Feature added] Self collision - off by default, opt-in per object.
+        # Applied exactly once per frame, not per iteration, to avoid
+        # fighting/oscillating with the existing stiffness/stretch constraints.
         if getattr(ob, "wiggle_self_collide", False):
             apply_self_collision(active_bones, getattr(ob, "wiggle_self_collide_margin", 0.0))
 
-        # [버그 수정] Angle Limit(Total Limit)이 move()에서만 적용되고 그 뒤에
-        # 도는 constrain() 반복 솔버는 각도 제한을 모른 채 위치를 다시 끌고
-        # 나가서, 예를 들어 10도로 설정해도 실제로는 훨씬 크게(예: 90도) 벌어
-        # 지던 문제. 모든 constrain() 반복이 끝난 뒤 한 번 더 재클램프.
+        # [Bug fix] Angle Limit (Total Limit) was only applied in move(),
+        # and the iterative solver in constrain() that runs afterward knows
+        # nothing about angle limits, so it kept dragging the position back
+        # out - e.g. setting a 10-degree limit could actually end up much
+        # wider (e.g. 90 degrees). Re-clamp once more after all of
+        # constrain()'s iterations finish.
         for b in active_bones:
             reclamp_angle_limit(b)
 
@@ -1289,35 +1324,42 @@ def wiggle_post(scene, dg):
             update_matrix(b, True)
             inf = getattr(b, "wiggle_influence", 1.0)
 
-            # [버그 수정] Sim Mix Layers의 Layer Weight/Sim Mix가 최종 포즈에
-            # 전혀 반영되지 않던 문제. (1) b.rotation_quaternion에만 썼는데,
-            # rotation_mode가 QUATERNION이 아니면(대부분의 게임/UE5용
-            # 리그는 Euler를 씀) Blender가 그 채널을 아예 평가에 쓰지 않아서
-            # 조용히 무시됨. (2) 그 뒤에 다시 부른 update_matrix(b, True)가
-            # rotation_quaternion을 전혀 읽지 않고 b.wiggle.position만으로
-            # 행렬을 다시 계산해서, 방금 블렌드한 값을 곧바로 덮어써버렸음
-            # (QUATERNION 모드여도 무효). matrix_basis에서 실제 시뮬레이션
-            # 회전을 읽어 블렌드하고, 본의 실제 rotation_mode에 맞는 채널에
-            # 써서 두 문제를 모두 해결. 이후 update_matrix()는 다시 부르지
-            # 않음(부르면 방금 쓴 채널을 무시하고 물리 상태로 또 덮어씀).
+            # [Bug fix] The Sim Mix Layers' Layer Weight/Sim Mix never showed
+            # up in the final pose at all. (1) It only wrote to
+            # b.rotation_quaternion, but if rotation_mode isn't QUATERNION
+            # (most game/UE5-style rigs use Euler), Blender doesn't evaluate
+            # that channel at all, so it was silently ignored. (2) The
+            # subsequent call to update_matrix(b, True) never read
+            # rotation_quaternion and recomputed the matrix purely from
+            # b.wiggle.position, immediately overwriting the value that was
+            # just blended (even when in QUATERNION mode, it had no
+            # effect). Fixed by reading the actual simulated rotation from
+            # matrix_basis, blending it, and writing to whichever channel
+            # matches the bone's actual rotation_mode - this solves both
+            # problems. update_matrix() is not called again after this
+            # (doing so would ignore the channel just written and overwrite
+            # it with the physics state again).
             sim_q = b.matrix_basis.to_quaternion()
             anim_q = orig_rots.get(b.name, Quaternion((1, 0, 0, 0)))
 
-            # [버그 수정] 회전만 블렌드하고 위치는 그대로 뒀던 문제.
-            # wiggle_head가 플로팅(use_connect 아님)인 본은 update_matrix()가
-            # b.location도 물리 위치로 직접 써버리는데, 회전만 애니메이션
-            # 쪽으로 되돌려도 위치는 여전히 물리 결과에 남아있어서 influence
-            # 를 0으로 내려도 본이 코일처럼 튀어나온 채로 남아있었음. 위치도
-            # 똑같이 애니메이션 원본 쪽으로 되돌림.
+            # [Bug fix] Only rotation was blended while position was left
+            # alone. For a bone with a floating wiggle_head (use_connect
+            # off), update_matrix() writes b.location directly from the
+            # physics position, so even reverting only rotation toward
+            # animation left the position sitting at the physics result -
+            # the bone would still stick out like a coil even at
+            # influence=0. Position is now reverted toward the original
+            # animation the same way.
             sim_loc = b.location.copy()
             anim_loc = orig_locs.get(b.name, sim_loc)
             sim_scale = b.scale.copy()
             anim_scale = orig_scales.get(b.name, sim_scale)
 
-            # Sim Mix Layers가 실제 프레임을 바꾸지 않고도(슬라이더만
-            # 만졌을 때) 새 influence로 즉시 다시 블렌드할 수 있도록, inf
-            # 값과 무관하게 이번 프레임의 순수 애니메이션/시뮬레이션
-            # 회전·위치·스케일을 항상 캐시해둔다.
+            # So the Sim Mix Layers can immediately re-blend with a new
+            # influence value without changing the current frame (i.e. just
+            # by moving the slider), always cache this frame's pure
+            # animation/simulation rotation, position, and scale regardless
+            # of the current inf value.
             _LAST_BLEND_CACHE[(ob.name, b.name)] = (
                 anim_q.copy(), sim_q.copy(), b.rotation_mode,
                 anim_loc.copy(), sim_loc.copy(),
@@ -1336,7 +1378,7 @@ def wiggle_post(scene, dg):
                 b.location = anim_loc.lerp(sim_loc, inf)
                 b.scale = anim_scale.lerp(sim_scale, inf)
 
-        # 5. 속도 업데이트 (원본 수치 유지: fe로 나누지 않음)
+        # 5. Update velocity (keeps the original values: not divided by fe)
         for b in active_bones:
             bw = b.wiggle
             bw.velocity = (bw.position - bw.position_last)
@@ -1369,6 +1411,16 @@ def wiggle_load(dummy):
     if scene and hasattr(scene, "wiggle"):
         scene.wiggle.is_rendering = False
         scene.wiggle.lastframe = scene.frame_current
+        # Self-heal: scene.wiggle.reset is a plain saved BoolProperty
+        # that, if left True (e.g. from a Hard Reset that threw an
+        # exception before the WiggleReset fix below), permanently
+        # disables all simulation in that file - wiggle_post()'s very
+        # first check is "if w.reset: return", with no UI anywhere
+        # showing this flag is set. Any file saved in that state would
+        # load with simulation silently dead forever. Force it False on
+        # every load so an already-broken file heals itself the moment
+        # it's reopened, regardless of what left it stuck.
+        scene.wiggle.reset = False
 
 # END OF REVISION #
 
@@ -1387,9 +1439,9 @@ class WiggleCopy(bpy.types.Operator):
         b = context.active_pose_bone
         selected_bones = context.selected_pose_bones
 
-        # 하드코딩된 속성 목록 대신 "wiggle_" 접두사를 가진 모든 프로퍼티를
-        # 자동으로 순회해서 복사합니다. 새 속성이 추가돼도 이 목록이 낡아서
-        # 누락되는 일이 없습니다.
+        # Instead of a hardcoded property list, automatically iterate over
+        # every property with a "wiggle_" prefix and copy it. This way the
+        # list never goes stale and misses newly added properties.
         props = [p.identifier for p in b.bl_rna.properties
                   if p.identifier.startswith('wiggle_') and not p.is_readonly]
 
@@ -1416,27 +1468,48 @@ class WiggleReset(bpy.types.Operator):
         return context.scene.wiggle_enable and context.mode in ['OBJECT', 'POSE']
 
     def execute(self, context):
-        # 1. 물리 엔진 일시 정지 신호
+        # Bug fix: scene.wiggle.reset is a plain saved BoolProperty, and
+        # wiggle_post()'s very first check is "if w.reset: return" - it
+        # unconditionally disables ALL physics for this scene. This used
+        # to set reset=True, then reset=False only at the very end with
+        # no try/finally in between. If reset_bones_batch() (or the
+        # lookup loop around it) ever threw - e.g. a stale bone
+        # reference after deleting a bone/armature, a malformed list
+        # entry - the operator aborted partway through and reset stayed
+        # True forever. Since it's saved with the file, this could
+        # permanently disable simulation on every future load of that
+        # file, with no visible indicator anywhere the flag is even
+        # exposed in the UI. Wrapped in try/finally so reset is
+        # guaranteed to end up False regardless of what happens, and
+        # each object's reset is now individually guarded so one bad
+        # entry can't abort the rest.
         context.scene.wiggle.reset = True
+        try:
+            # Gather every bone in the scene and reset them all in one
+            # batch (calling view_layer.update() per bone would get very
+            # slow on rigs with many bones - reset_bones_batch only
+            # updates once for the whole set).
+            for wo in context.scene.wiggle.list:
+                ob = context.scene.objects.get(wo.name)
+                if not ob:
+                    continue
+                try:
+                    bones = [ob.pose.bones.get(wb.name) for wb in wo.list]
+                    reset_bones_batch(bones)
+                except Exception as e:
+                    print(f"Wiggle2: reset failed for '{ob.name}'({e})")
 
-        # 2. 리셋 실행 - 씬 전체 본을 모아 한 번에 배치 리셋
-        #    (본마다 개별 view_layer.update()를 부르면 본이 많은 리그에서
-        #    매우 느려짐 - reset_bones_batch가 전체에 대해 한 번만 갱신)
-        for wo in context.scene.wiggle.list:
-            ob = context.scene.objects.get(wo.name)
-            if ob:
-                bones = [ob.pose.bones.get(wb.name) for wb in wo.list]
-                reset_bones_batch(bones)
+            # Pin the last-computed frame to the current one so the handler doesn't re-track it.
+            context.scene.wiggle.lastframe = context.scene.frame_current
+        finally:
+            context.scene.wiggle.reset = False
 
-        # 3. 마지막 연산 프레임을 현재로 고정하여 핸들러의 추적 방지
-        context.scene.wiggle.lastframe = context.scene.frame_current
-        context.scene.wiggle.reset = False
-        
-        # 5. 화면 강제 새로고침
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                area.tag_redraw()
-        
+        # Force a viewport redraw.
+        if context.screen:
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+
         return {'FINISHED'}
 # END OF REVISION #
 
@@ -1466,8 +1539,8 @@ class WiggleSelect(bpy.types.Operator):
                 if not b:
                     rebuild = True
                     continue
-                # Blender 버전에 따라 PoseBone.select / Bone.select 둘 다
-                # 없을 수 있어 방어적으로 처리
+                # Depending on the Blender version, neither PoseBone.select
+                # nor Bone.select may exist, so handle it defensively
                 if hasattr(b, "select"):
                     b.select = True
                 if hasattr(b.bone, "select"):
@@ -1475,14 +1548,16 @@ class WiggleSelect(bpy.types.Operator):
                 if first_bone is None:
                     first_bone, first_ob = b, ob
 
-        # [버그 수정] 본들을 새로 선택만 하고 활성 본(active bone)은 전혀
-        # 안 바꿔서, 클릭하기 전에 활성 본이 우연히 위글과 무관한(예:
-        # Tail이 꺼진) 본이었으면 그 상태가 그대로 남아있었다. 그러면
-        # 속성 패널은 방금 선택한 본들이 아니라 그 옛날 활성 본의 값을
-        # 계속 보여주고, 거기서 체크박스를 누르면 update_prop()이 그 값을
-        # (진짜로) 선택된 본들 전체로 전파하면서 엉뚱한 본까지 같이
-        # 켜지는/꺼지는 결과가 났다. 방금 선택한 본 중 하나를 활성 본으로
-        # 지정해서 패널이 항상 실제로 선택된 본의 값을 보여주게 한다.
+        # [Bug fix] This only newly selected bones and never changed the
+        # active bone, so if the active bone happened to be unrelated to
+        # wiggle before clicking (e.g. one with Tail disabled), that state
+        # just stayed. The properties panel would then keep showing the
+        # old active bone's values instead of the just-selected bones', and
+        # toggling a checkbox there would have update_prop() propagate that
+        # value across the (actually) selected bones, incorrectly
+        # enabling/disabling unrelated bones too. Now one of the
+        # just-selected bones is set as the active bone so the panel always
+        # shows the values of an actually selected bone.
         if first_bone is not None:
             first_ob.data.bones.active = first_bone.bone
 
@@ -1502,7 +1577,7 @@ class WiggleBake(bpy.types.Operator):
         return context.object and context.object.type == 'ARMATURE'
 
     def execute(self, context):
-        # 1. 초기 설정
+        # 1. Initial setup
         obj = context.active_object
         scene = context.scene
         wiggle_props = scene.wiggle
@@ -1511,7 +1586,7 @@ class WiggleBake(bpy.types.Operator):
         end_frame = scene.frame_end
         original_frame = scene.frame_current
         duration = end_frame - start_frame
-        # 루프 보정 구간 (마지막 20%)
+        # Loop-correction window (last 20%)
         blend_frames = int(duration * 0.2) 
 
         bake_bones = [
@@ -1530,63 +1605,137 @@ class WiggleBake(bpy.types.Operator):
         if not obj.animation_data:
             obj.animation_data_create()
 
+        # [Bug fix] When "Overwrite Current Action" was enabled, this used
+        # to simply call keyframe_insert on the currently active action.
+        # That was "overlaying," not "overwriting": (1) the existing
+        # keyframes were never cleared, so new keys got mixed in on top of
+        # them, and (2) if that action was also already linked into an
+        # unmuted NLA strip and being blended, Blender would evaluate "this
+        # action in the NLA stack" plus "the same action as the active
+        # action" simultaneously, applying the pose twice on top of itself
+        # (matches exactly the "wiggle result doubles up" symptom users
+        # reported). For a true overwrite: the existing keyframes must be
+        # cleared first, and the track has to be muted during baking so the
+        # action isn't evaluated simultaneously with its own NLA strip.
+        from . import wiggle_layers as _wl
+        target_track = None
+        target_track_prev_mute = None
         if not wiggle_props.bake_overwrite:
             new_action = bpy.data.actions.new(name="WiggleAction")
+        else:
+            action = obj.animation_data.action
+            if not action:
+                new_action = bpy.data.actions.new(name="WiggleAction")
+            else:
+                _wl._clear_action_keyframes(action)
+                new_action = action
+
+        # [Bug fix, key one] This used to set the action to be baked as the
+        # active action right before the loop. Regardless of NLA track mute
+        # state, Blender always evaluates the "active action" once more on
+        # top of the NLA stack with REPLACE and influence=1.0 (a separate
+        # evaluation path). Since that action starts out empty, frame 1 is
+        # fine, but the moment the first keyframe is inserted, the action
+        # itself, acting as the "active action," starts overwriting the
+        # same channels again - so from frame 2 onward, what got baked
+        # wasn't the true Base+Sim (NLA) blend but a read of "the just-baked
+        # previous frame's value" reapplied (matches exactly the "result is
+        # just the physics, not the Base+Sim combination" symptom users
+        # reported). The fix: during the "read" phase, without touching the
+        # active action yet (so there's no overlay concern), capture each
+        # frame's purely-evaluated pose values into Python, then only in
+        # the subsequent "write" phase set the active action and write the
+        # captured values directly as keyframes per frame (since there's no
+        # re-evaluation, the overlay problem never arises).
+        _wl._baking_in_progress = True
+        captured = []  # list of (frame, {bone_name: (loc, rot_mode, rot, scale)})
+        try:
+            # 2. Preroll stabilization
+            scene.wiggle.is_preroll = True
+            preroll_start = start_frame - max(1, wiggle_props.preroll)
+            for f in range(preroll_start, start_frame):
+                scene.frame_set(f)
+                context.view_layer.update()
+            scene.wiggle.is_preroll = False
+
+            # 3. Main capture loop (the active action is not touched yet)
+            for f in range(start_frame, end_frame + 1):
+                scene.frame_set(f)
+                context.view_layer.update()
+                frame_data = {}
+                for pbone in bake_bones:
+                    if pbone.rotation_mode == 'QUATERNION':
+                        rot = pbone.rotation_quaternion.copy()
+                    elif pbone.rotation_mode == 'AXIS_ANGLE':
+                        rot = pbone.rotation_axis_angle[:]
+                    else:
+                        rot = pbone.rotation_euler.copy()
+                    frame_data[pbone.name] = (pbone.location.copy(), pbone.rotation_mode, rot, pbone.scale.copy())
+                captured.append((f, frame_data))
+
+            # 4. Now set the active action and write the captured values directly.
             obj.animation_data.action = new_action
-        
-        # 2. Preroll 안정화
-        scene.wiggle.is_preroll = True
-        preroll_start = start_frame - max(1, wiggle_props.preroll)
-        for f in range(preroll_start, start_frame):
-            scene.frame_set(f)
-            context.view_layer.update()
-        scene.wiggle.is_preroll = False
+            if wiggle_props.bake_overwrite:
+                target_track = _wl._find_track_for_action(obj, new_action)
+                if target_track:
+                    target_track_prev_mute = target_track.mute
+                    target_track.mute = True
+            if hasattr(obj.animation_data, "action_influence"):
+                obj.animation_data.action_influence = 1.0
+            if hasattr(obj.animation_data, "action_blend_type"):
+                obj.animation_data.action_blend_type = 'REPLACE'
 
-        # 3. 메인 베이크 루프
-        for f in range(start_frame, end_frame + 1):
-            scene.frame_set(f)
-            context.view_layer.update()
+            for f, frame_data in captured:
+                for pbone in bake_bones:
+                    loc, rot_mode, rot, scale = frame_data[pbone.name]
+                    pbone.location = loc
+                    pbone.keyframe_insert(data_path="location", frame=f, group=pbone.name)
+                    if rot_mode == 'QUATERNION':
+                        pbone.rotation_quaternion = rot
+                        pbone.keyframe_insert(data_path="rotation_quaternion", frame=f, group=pbone.name)
+                    elif rot_mode == 'AXIS_ANGLE':
+                        pbone.rotation_axis_angle = rot
+                        pbone.keyframe_insert(data_path="rotation_axis_angle", frame=f, group=pbone.name)
+                    else:
+                        pbone.rotation_euler = rot
+                        pbone.keyframe_insert(data_path="rotation_euler", frame=f, group=pbone.name)
+                    pbone.scale = scale
+                    pbone.keyframe_insert(data_path="scale", frame=f, group=pbone.name)
+        finally:
+            _wl._baking_in_progress = False
+            if target_track:
+                target_track.mute = target_track_prev_mute if target_track_prev_mute is not None else False
 
-            for pbone in bake_bones:
-                pbone.keyframe_insert(data_path="location", group=pbone.name)
-                if pbone.rotation_mode == 'QUATERNION':
-                    pbone.keyframe_insert(data_path="rotation_quaternion", group=pbone.name)
-                elif pbone.rotation_mode == 'AXIS_ANGLE':
-                    pbone.keyframe_insert(data_path="rotation_axis_angle", group=pbone.name)
-                else:
-                    pbone.keyframe_insert(data_path="rotation_euler", group=pbone.name)
-                pbone.keyframe_insert(data_path="scale", group=pbone.name)
-
-        # 4. [핵심] Seamless Loop 보정 (AttributeError 수정 포함)
+        # 4. [Key step] Seamless Loop correction (includes AttributeError fix)
         if obj.animation_data and obj.animation_data.action:
             action = obj.animation_data.action
             bone_names = {b.name for b in bake_bones}
-            
-            # Blender 4.0+ .curves / 하위 버전 .fcurves 호환 처리
+
+            # Handle Blender 4.0+ .curves / older-version .fcurves compatibility
             curves = getattr(action, "curves", getattr(action, "fcurves", []))
-            
+
             for fc in curves:
                 if any(f'["{name}"]' in fc.data_path for name in bone_names):
-                    # 시작 프레임 값 캡처
+                    # Capture the start-frame value
                     start_val = fc.evaluate(start_frame)
-                    
-                    # 루프 블렌딩 실행
+
+                    # Run the loop blend
                     if blend_frames > 0:
                         for f in range(end_frame - blend_frames, end_frame + 1):
                             t = (f - (end_frame - blend_frames)) / blend_frames
                             current_val = fc.evaluate(f)
-                            # 끝값을 시작값으로 서서히 보간
+                            # Gradually interpolate the end value toward the start value
                             blended_val = current_val * (1.0 - t) + start_val * t
                             fc.keyframe_points.insert(f, blended_val, options={'FAST'})
 
-                    # 핸들 정리
+                    # Clean up handles
                     for kp in fc.keyframe_points:
                         kp.interpolation = 'BEZIER'
                         kp.handle_left_type = 'AUTO'
                         kp.handle_right_type = 'AUTO'
                     fc.update()
 
-        # 5. 마무리 및 복구
+        # 5. Wrap-up and restore
         obj.wiggle_freeze = True
         scene.frame_set(original_frame)
         
@@ -1656,7 +1805,7 @@ class WiggleToggleBBox(bpy.types.Operator):
         is_capsule = len(g.data.vertices) > 100
         for v in g.data.vertices:
             if is_capsule:
-                # 생성 시 초기 정점들을 Head(0)와 Tail(offset)로 분리 배치
+                # On creation, split the initial vertices into Head (0) and Tail (offset)
                 if v.co.z > 0.01:
                     v.co.z = (v.co.z - 0.5) + offset
                 else:
@@ -1698,15 +1847,15 @@ class WiggleToggleBBox(bpy.types.Operator):
                 g.name = f"WGuide_{pb.name}"
                 g.display_type, g.hide_render = 'WIRE', True
                 
-                # 본에 페어런팅 및 트랜스폼 정렬
+                # Parent to the bone and align its transform
                 g.parent, g.parent_type, g.parent_bone = arm, 'BONE', pb.name
                 g.matrix_local = Matrix.Identity(4)
-                g.rotation_euler = (1.570796, 0, 0) # 본 진행방향 정렬
-                
-                # 초기 모양 보정 함수 호출
+                g.rotation_euler = (1.570796, 0, 0) # Align to the bone's direction of travel
+
+                # Call the initial shape-correction function
                 WiggleToggleBBox.update_mesh_shape(pb, context)
 
-        # 포즈 모드 복귀를 위한 활성 오브젝트 재설정
+        # Reset the active object so we can return to pose mode
         context.view_layer.objects.active = arm
         if bpy.ops.object.mode_set.poll():
             try:
@@ -1726,7 +1875,7 @@ class WigglePreset(bpy.types.Operator):
     type: bpy.props.StringProperty()
 
     def execute(self, context):
-        # 💡 [치명적 버그 수정] 단일 active_pose_bone 대신, 드래그로 다중 선택된 모든 본들(selected_bones)을 가져옵니다.
+        # [Critical bug fix] Use selected_bones (all bones multi-selected via drag) instead of just the single active_pose_bone.
         selected_bones = getattr(context, "selected_pose_bones", []) or []
         if not selected_bones:
             self.report({'WARNING'}, "No pose bone selected")
@@ -1741,7 +1890,7 @@ class WigglePreset(bpy.types.Operator):
             self.report({'ERROR'}, f"Module Load Error: {e}")
             return {'CANCELLED'}
             
-        # 프리셋 종류별 수치 매칭 파싱
+        # Look up the matching values for each preset type
         if self.type == 'JELLY':
             s_start, s_end = 20.0, 5.0
             d_start, d_end = 1.0, 0.1
@@ -1769,7 +1918,7 @@ class WigglePreset(bpy.types.Operator):
         else:
             return {'CANCELLED'}
             
-        # 💡 [정밀 수정] 루프를 돌며 드래그 선택된 본 전체에 해당 물리 설정을 강제 대입시킵니다.
+        # [Precision fix] Loop over every drag-selected bone and force-apply this physics setting to all of them.
         for b in selected_bones:
             b.wiggle_stiff_use_dist = True
             b.wiggle_damp_use_dist = True
@@ -1818,7 +1967,7 @@ class WiggleBone(bpy.types.PropertyGroup):
     collision_point_head:bpy.props.FloatVectorProperty(subtype = 'TRANSLATION', override={'LIBRARY_OVERRIDABLE'})
     collision_ob_head: bpy.props.PointerProperty(type=bpy.types.Object, override={'LIBRARY_OVERRIDABLE'})
     collision_normal_head: bpy.props.FloatVectorProperty(subtype = 'TRANSLATION', override={'LIBRARY_OVERRIDABLE'})
-    # Adaptive Safety Guard 내부 계산값
+    # Internal computed value for Adaptive Safety Guard
     adaptive_damp_mod: bpy.props.FloatProperty(default=0.0, override={'LIBRARY_OVERRIDABLE'})
 
 class WiggleObject(bpy.types.PropertyGroup):
@@ -1922,9 +2071,10 @@ def register():
         name = 'Damp', min = 0, default = 1, override={'LIBRARY_OVERRIDABLE'},
         update=lambda s, c: update_prop(s, c, 'wiggle_damp')
     )
-    # wiggle_angle_limit 는 ui_panel.py 에서 등록(정밀도 등 최종 정의).
-    # 여기서 중복 등록하면 등록 순서에 따라 서로 덮어써서 unregister()가
-    # 꼬일 수 있으므로 제거.
+    # wiggle_angle_limit is registered in ui_panel.py (final definition,
+    # including precision, etc.). Registering it again here would let
+    # registration order overwrite one with the other and tangle up
+    # unregister(), so it's removed from here.
 
     bpy.types.PoseBone.wiggle_gravity = bpy.props.FloatProperty(
         name = 'Gravity', default = 1, override={'LIBRARY_OVERRIDABLE'},
@@ -2050,13 +2200,14 @@ def register():
         WiggleObject, WiggleScene, WiggleReset, WiggleCopy, WiggleSelect, WiggleBake,
         WiggleBakeCache, WiggleClearCache
     )
-    # [버그 수정] hasattr(bpy.types, cls.__name__)는 Operator/Panel 클래스가
-    # 실제로 등록됐는지 전혀 반영하지 못한다(Blender 5.x에서 실측 확인 -
-    # register_class/bpy.ops는 정상 동작하는데도 hasattr는 등록 전후 내내
-    # False). 그래서 이 가드로는 "이미 등록됨"을 절대 걸러내지 못해
-    # 재등록(Reload Scripts, 비활성화 없이 다시 활성화 등) 시
-    # "already registered" 예외가 났다. try/except로 실제 예외를 기준으로
-    # 판단해야 한다.
+    # [Bug fix] hasattr(bpy.types, cls.__name__) doesn't reflect whether an
+    # Operator/Panel class is actually registered at all (confirmed live on
+    # Blender 5.x - register_class/bpy.ops work fine, but hasattr stays
+    # False both before and after registration). So this guard could never
+    # catch "already registered," and re-registering (Reload Scripts,
+    # disabling and re-enabling, etc.) raised an "already registered"
+    # exception. Need to judge based on the actual exception via
+    # try/except instead.
     for cls in classes:
         try:
             bpy.utils.register_class(cls)
@@ -2067,7 +2218,7 @@ def register():
     bpy.types.Object.wiggle = bpy.props.PointerProperty(type=WiggleObject, override={'LIBRARY_OVERRIDABLE'})
     bpy.types.Scene.wiggle = bpy.props.PointerProperty(type=WiggleScene, override={'LIBRARY_OVERRIDABLE'})
 
-    # 포인트 캐시 (디스크)
+    # Point cache (disk)
     if not hasattr(bpy.types.Scene, "wiggle_cache_enable"):
         bpy.types.Scene.wiggle_cache_enable = bpy.props.BoolProperty(
             name="Use Disk Cache",
@@ -2089,19 +2240,21 @@ def register():
     if wiggle_render_cancel not in h_r_can: h_r_can.append(wiggle_render_cancel)
     h_load = bpy.app.handlers.load_post
     if wiggle_load not in h_load: h_load.append(wiggle_load)
-    # wiggle_influence 는 wiggle_layers.py 에서 등록 (default=1.0).
-    # 여기서 중복 등록하면 default 값이 덮어씌워지므로 제거.
+    # wiggle_influence is registered in wiggle_layers.py (default=1.0).
+    # Registering it again here would overwrite that default value, so it's removed from here.
     # wiggle_use_lattice / wiggle_lattice_stiffness / wiggle_lattice_show_debug
-    # 는 __init__.py 에서 wiggle_lattice_visual 모듈과 함께 등록됨.
+    # are registered together with the wiggle_lattice_visual module in __init__.py.
 
 def unregister():
-    # [버그 수정] PointerProperty(bpy.types.*.wiggle 등)가 WiggleBone/
-    # WiggleObject/WiggleScene PropertyGroup 클래스를 참조하고 있는 동안
-    # 그 클래스를 먼저 unregister_class 하면 예외가 나서, reversed(classes)
-    # 루프가 중간에 멈춰버리고 그 뒤에 있는 클래스(WiggleToggleBBox 등)는
-    # 영원히 등록 해제되지 않는다 - 애드온을 끄고 다시 켜면(re-register)
-    # "already registered as a subclass" 오류가 남. 그래서 프로퍼티(특히
-    # PointerProperty)는 클래스를 해제하기 전에 먼저 지워야 한다.
+    # [Bug fix] While PointerProperty (bpy.types.*.wiggle, etc.) still
+    # references the WiggleBone/WiggleObject/WiggleScene PropertyGroup
+    # classes, calling unregister_class on those classes first raises an
+    # exception, which stops the reversed(classes) loop partway through -
+    # classes after that point (WiggleToggleBBox, etc.) never get
+    # unregistered. Then disabling and re-enabling the addon (re-register)
+    # leaves an "already registered as a subclass" error. So the
+    # properties (especially PointerProperty) must be cleared before the
+    # classes are unregistered.
     for attr in ("wiggle_cache_enable", "wiggle_cache_dir", "wiggle_enable", "wiggle"):
         if hasattr(bpy.types.Scene, attr):
             try: delattr(bpy.types.Scene, attr)
@@ -2136,9 +2289,10 @@ def unregister():
         WiggleObject, WiggleScene, WiggleReset, WiggleCopy, WiggleSelect, WiggleBake,
         WiggleBakeCache, WiggleClearCache
     )
-    # [버그 수정] register()와 같은 이유로 hasattr 가드를 제거하고
-    # try/except로 바꾼다 - hasattr(bpy.types, cls.__name__)가 항상 False라
-    # 이 가드로는 unregister_class가 사실상 한 번도 호출되지 않고 있었다.
+    # [Bug fix] For the same reason as register(), remove the hasattr guard
+    # and switch to try/except - since hasattr(bpy.types, cls.__name__) is
+    # always False, this guard meant unregister_class was effectively never
+    # being called.
     for cls in reversed(classes):
         try:
             bpy.utils.unregister_class(cls)

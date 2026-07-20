@@ -15,6 +15,30 @@
 
 ---
 
+## 🆕 What's New in v2.2.9
+
+The headline fix this release: a bug that could **permanently disable simulation in a saved file, with zero indication anywhere why** — if you've had a file that mysteriously "went dead," this is almost certainly it, and it now fixes itself the moment you reopen the file. Also fixes two separate cases of the Layer Weight slider appearing to do nothing, and a Blender 5.2-specific display glitch on Total Limit.
+
+*   **Fixed (critical): simulation could permanently stop working after a Hard Reset, even across saves and reloads.** The Hard Reset button briefly flags physics to pause while it resets every bone, then un-flags it when done — but if that reset hit any snag along the way (a bone that no longer existed, for example), it could stop partway through and leave physics flagged "paused" forever, with no checkbox or indicator anywhere showing this. Saving the file locked that broken state in permanently — every future reload would show a rig that just sits there doing nothing. Two fixes: Hard Reset can no longer get stuck this way, and **any file that was already affected now heals itself automatically the instant it's opened** — no manual fix needed.
+*   **Fixed: Layer Weight looking "stuck" once dragged down to 0%.** Dragging a layer's Weight slider all the way to 0 used to also mute its NLA track for efficiency — but Blender doesn't re-evaluate a muted track at all, so the Influence value shown in the NLA editor would visibly freeze at whatever it was right before hitting 0, making it look like the slider had stopped working. Weight now reads correctly all the way down to 0% at every step.
+*   **Fixed: Layer Weight silently frozen while a strip is being edited in the NLA editor.** If a strip was left open in NLA Tweak Mode (e.g. from a double-click), Layer Weight would stop affecting anything with no explanation. The Sim Mix Layers panel now shows a clear warning with a one-click "Exit NLA Tweak Mode" button whenever this happens.
+*   **Fixed (Blender 5.2): Total Limit could show a broken, unreadable field instead of a number.** A fallback path meant to paper over a rare Blender 5.1 registry timing quirk rendered incorrectly on 5.2 instead, showing an unusable field rather than the actual value. Property registration is now sequenced so this fallback should essentially never be needed, and the fallback itself now fails safely with a plain message instead of a broken field if it ever is.
+
+---
+
+## 🆕 What's New in v2.2.8
+
+A correctness- and stability-focused release for Sim Mix Layers and Bake Result C, plus a UI reorganization aimed at making the panel layout easier to navigate.
+
+*   **Fixed: Bake Result C only captured wiggle-enabled bones.** "Combined" bakes were silently dropping every other bone in the rig — torso, limbs, anything driven by your Base animation that isn't itself a physics bone. A bake that looked self-contained actually wasn't: the moment Base was muted or its source action removed, all of those un-baked bones had nothing left driving them. Bake Result C now always bakes the entire armature, so the result is a genuinely complete, standalone action.
+*   **Fixed: a real crash — "Unable to add strip (the track does not have any space to accommodate this new strip)".** Could happen when the Base layer's internal NLA track already had a strip pointing at a different action than expected (e.g. left over from an earlier version, or after manually reassigning it). Fixed by reusing the existing strip instead of blindly trying to add a second one.
+*   **Fixed: manually changing the Base layer's linked action (via the NLA editor) kept reverting.** If you repointed the "WGL_Base" strip to a different action directly in the NLA editor, the very next sync (including every frame during playback) would silently change it back to whatever was originally cached. The strip's own action is now treated as the source of truth, so manual changes stick.
+*   **Fixed: deleting a layer's source action silently spawned a confusing replacement.** If you deleted an action that a Base or Sim layer still depended on (e.g. cleaning up "old" actions after baking), the addon used to quietly create a brand-new blank action in its place — including, on the Sim side, a bug that produced oddly-doubled action names (e.g. `Act_Sim_Act_Sim_...`) and an orphaned duplicate NLA track. The layer is now automatically muted instead, with a clear console message naming exactly which action went missing, so nothing is silently faked.
+*   **Fixed: "Overwrite Current Action" did nothing observable.** Bake Result C always created a brand-new "Bake" layer regardless of this checkbox — Overwrite only controlled whether that already-empty new action got cleared (a no-op). Overwrite now does what it says: with a Sim layer selected in the list, baking with Overwrite on writes directly into that layer's own action instead of creating a new one.
+*   **UI reorganization**: All bake-related controls (Preroll, Overwrite Current Action, Current Action to NLA, the Bake Result C button, and Disk Point Cache) have moved out of the Sim Mix Layers panel and into **Global Utilities → Bake**, positioned right below the Loop Physics toggle. This matches the actual workflow order (set up layers → tune physics → loop → bake) and keeps the Sim Mix Layers panel short, so Safety Guard / Head / Tail settings below it are easier to find without scrolling past a long bake section.
+
+---
+
 ## 🆕 What's New in v2.2.7
 
 A maintenance release focused on **addon lifecycle stability** and **Bake Result C safety**, plus a full audit pass across the codebase to remove leftover debug output and dead code.
@@ -70,7 +94,7 @@ Together, they form a "Zero-Waste" ecosystem—from initial strand creation to t
 
 ---
 
-## 📖 User Guide: Wiggle 2 Physics v2.2.7
+## 📖 User Guide: Wiggle 2 Physics v2.2.9
 
 ### Step 1: Initializing your Physics Stack
 To begin using Wiggle 2 RTX, you must first define your animation and simulation layers. The system will not calculate physics until these layers are initialized.
@@ -107,6 +131,7 @@ To begin using Wiggle 2 RTX, you must first define your animation and simulation
 *   Toggle: Switches between per-bone individual limits and global settings.
 *   Total Limit: Sets the maximum allowed rotation. Higher values allow larger motion; lower values (e.g., 30-60°) prevent mesh clipping.
 *   **v2.2.6 fix**: Total Limit now holds correctly at every **Quality** level. Previously, raising Quality could let the bone swing far past the number you set (e.g. 10° behaving like 90°) — that's fixed, so you can safely raise Quality for smoother motion without your limit breaking.
+*   **v2.2.9 fix (Blender 5.2)**: Total Limit could show a broken, unreadable field instead of a number right after enabling the addon. That's fixed — if you still ever see this, use Blender's "Reload Scripts" once.
 *   **Individual Limits (X / Z)**: Instead of one cone-shaped Total Limit, this lets you set separate up-down (X) and left-right (Z) ranges — useful for things like eyelids or fins that should only move in one plane.
 
 <video width="100%" controls>
@@ -120,9 +145,12 @@ This core feature handles keyframes (animation) and simulation (physics) as a si
 
 ![Sim Mix Layers UI](assets/image.png)
 
-*   **Bake Result C (Composite Bake)**: Merges keyframes and simulation into a single keyframe track while preserving the exact layer mix weights.
-*   **v2.2.7 change**: Bake Result C no longer bakes into your currently selected Sim layer. Every bake now creates a **new Sim layer** (named "Bake", "Bake 2", ...) with its own new action, added to the Sim Mix Layers list and auto-selected. This means baking is always non-destructive to your existing Sim layers, and you can bake the same range multiple times (e.g. to compare variations) without losing earlier results — just delete layers you don't want to keep.
-*   **Non-destructive workflow**: Keeps `Base_Anim` (and every existing Sim layer) untouched while cleanly extracting only the simulated result into its own layer.
+*   **Layer Weight (%)**: Cross-fades this layer against everything below it (0% = fully hidden, 100% = fully replaces what's below). **v2.2.9 fix**: dragging this to 0% used to make the Influence value shown in the NLA editor visibly freeze instead of reaching 0 — it now updates correctly at every step down to 0%. **v2.2.9 fix**: if a strip is left open for editing in NLA Tweak Mode (e.g. from double-clicking it in the NLA editor), this panel now shows a clear warning with a one-click button to exit Tweak Mode and restore Layer Weight — previously it would just silently stop doing anything with no explanation.
+*   **Bake Result C (Composite Bake)**: Merges keyframes and simulation into a single keyframe track while preserving the exact layer mix weights. **As of v2.2.8, the Bake Result C button and all its settings (Preroll/Overwrite/NLA) live under Global Utilities → Bake, below Loop Physics** — not in this panel. This is still the **only** bake control in the addon; see Step 7 below for the full bake workflow.
+*   **v2.2.8 fix**: Bake Result C now captures **every bone in the armature**, not just wiggle-enabled ones. Previously a "combined" bake silently skipped anything Base alone was driving (torso, limbs, etc.), so the result wasn't actually self-contained — it only looked that way until you removed Base.
+*   **Non-default behavior**: By default, baking creates a **new Sim layer** (named "Bake", "Bake 2", ...) with its own new action, added to the Sim Mix Layers list and auto-selected — non-destructive to your existing layers, so you can bake the same range multiple times to compare variations without losing earlier results. Turning on **Overwrite Current Action** (Step 7) changes this: with a Sim layer selected in this list, baking writes directly into that layer's own action instead of creating a new one.
+*   **Fixed (v2.2.7)**: the baked result now always reads the true combined Base+Sim pose at every frame before writing any keyframes, so it always matches exactly what you see in the viewport before baking.
+*   **Non-destructive workflow**: Keeps `Base_Anim` (and every existing Sim layer) untouched while cleanly extracting only the simulated result into its own layer (unless Overwrite is on — see above).
 *   **Game-engine friendly**: Flattens the animation so Unity/Unreal playback matches the Blender viewport 100%.
 
 <video width="100%" controls>
@@ -205,11 +233,13 @@ Applies optimized baseline values for common scenarios: **Jelly / Hair / Heavy /
 
 ![Bake System UI](assets/image 7.png)
 
-*   **Loop Physics**: Smoothly connects physics state from last frame back to the first, so a looping animation doesn't "snap" or reset at the seam. Fixed in v2.2.6 — this toggle previously had no effect; it now works as a single, reliable control. Turn it on before baking a looping cycle (walk cycles, idle animations, etc.).
-*   **Preroll**: Number of extra stabilization frames simulated *before* your bake range starts (typically 10~30 frames), so the physics has already "settled" by the time your actual animation begins instead of starting from a stiff, frozen pose. Now actually applied when you bake.
-*   **Overwrite Current Action**: When on, bakes directly into your current action instead of creating a new one. When off, a new action is created for you so your original stays untouched. Now actually applied.
-*   **Current Action to NLA**: When on, your existing action is pushed down to an NLA track before baking, keeping it safely archived instead of being overwritten. Now actually applied.
-*   **Bake (with Auto-Off)**: Automatically turns off realtime physics after the bake completes, so playback shows the baked keyframes instead of re-simulating on top of them.
+> **Location (v2.2.8)**: this entire step now lives under **Global Utilities → Bake**, with Loop Physics at the top of that same panel and everything else below it — not in the Sim Mix Layers panel. There is still only one bake control in the whole addon: **Bake Result C**.
+
+*   **Loop Physics**: Smoothly connects physics state from last frame back to the first, so a looping animation doesn't "snap" or reset at the seam. Turn it on before baking a looping cycle (walk cycles, idle animations, etc.).
+*   **Preroll**: Number of extra stabilization frames simulated *before* your bake range starts (typically 10~30 frames), so the physics has already "settled" by the time your actual animation begins instead of starting from a stiff, frozen pose.
+*   **Overwrite Current Action**: When off (default), each bake creates a **new Sim layer + action** in Sim Mix Layers, leaving everything else untouched. When on, baking writes directly into whichever **Sim layer is currently selected** in the Sim Mix Layers list, overwriting that layer's own action instead of creating a new one — select the layer you want to update first.
+*   **Current Action to NLA**: When on, your existing action is pushed down to an NLA track before baking, keeping it safely archived instead of being overwritten.
+*   **Bake Result C**: The button that actually runs the bake, using the three settings above. Always bakes the entire armature (every bone, not just wiggle-enabled ones) so the result is a complete, self-contained action — see Step 3 for details on what gets combined.
 
 ### Disk Point Cache (New)
 For long or heavy simulations, scrubbing the timeline normally forces Wiggle 2 to re-simulate every frame from the start each time you jump backward — which gets slow on long ranges. The new **Disk Point Cache** box lets you:

@@ -2,9 +2,10 @@ import bpy
 
 
 def wiggle_taper_callback(self, context):
-    # Root/Tip 슬라이더를 드래그할 때, 프리셋 버튼과 동일한 apply_taper_to_chain
-    # 로직으로 활성 본의 체인에 즉시 재적용한다. 기존에는 콜백이 no-op라서
-    # wiggle_stiff_use_dist 토글을 켜도 슬라이더를 움직이면 아무 효과가 없었음.
+    # Dragging the Root/Tip sliders re-applies to the active bone's chain
+    # immediately via the same apply_taper_to_chain logic used by the
+    # preset buttons. This callback used to be a no-op, so turning on
+    # wiggle_stiff_use_dist and moving the slider had no effect.
     bone = getattr(context, "active_pose_bone", None)
     if not bone or not getattr(bone, "wiggle_stiff_use_dist", False):
         return
@@ -34,7 +35,7 @@ def apply_taper_to_chain(target, attr, start_val, end_val):
 
 
 def register():
-    # 필수 속성 자동 등록 (다른 모듈에서 이미 등록했으면 건너뜀)
+    # Auto-register required properties (skip if another module already did).
     if not hasattr(bpy.types.Scene, "wiggle_enable"):
         bpy.types.Scene.wiggle_enable = bpy.props.BoolProperty(default=False)
     if not hasattr(bpy.types.Object, "wiggle_mute"):

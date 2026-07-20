@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "wiggle_2"
-version = "2.2.7"
+version = "2.2.9"
 name = "Wiggle 2: RTX Edition"
 
 tagline = " Instant Procedural Bone Physics for Any Rig"

@@ -8,14 +8,14 @@ from .physics_logic import wiggle_taper_callback, wiggle_damp_callback
 
 # ============================================================
 # __init__.py  (v4)
-# ▣ 모든 속성을 hasattr 가드로 단일 등록
-# ▣ 중복 정의 완전 제거
-# ▣ RTX Turbo(physics_logic의 가짜 GPU 엔진)는 제거된 상태로 유지.
-#   Horizontal Lattice는 사용자 요청으로 원본 그대로 복원됨.
+# - Every property registered once, guarded by hasattr
+# - Duplicate definitions fully removed
+# - RTX Turbo (physics_logic's fake GPU engine) stays removed.
+#   Horizontal Lattice was restored to its original form per user request.
 # ============================================================
 
 def register():
-    # ── PoseBone 속성 ──────────────────────────────────────
+    # -- PoseBone properties --------------------------------
     if not hasattr(bpy.types.PoseBone, "wiggle_stiff_use_dist"):
         bpy.types.PoseBone.wiggle_stiff_use_dist = bpy.props.BoolProperty(
             name="Use Stiff Dist.",
@@ -29,7 +29,7 @@ def register():
             description="Root-Tip distribution for damping"
         )
 
-    # ── Scene 속성 — Taper 슬라이더 ────────────────────────
+    # -- Scene properties: Taper sliders ---------------------
     if not hasattr(bpy.types.Scene, "wiggle_stiff_start"):
         bpy.types.Scene.wiggle_stiff_start = bpy.props.FloatProperty(
             name="Stiff Root", default=10.0, min=0.0,
@@ -51,7 +51,7 @@ def register():
             update=wiggle_damp_callback
         )
 
-    # ── Scene 속성 — Horizontal Lattice ──────────────────────
+    # -- Scene properties: Horizontal Lattice ----------------
     if not hasattr(bpy.types.Scene, "wiggle_use_lattice"):
         bpy.types.Scene.wiggle_use_lattice = bpy.props.BoolProperty(
             name="Enable Horizontal Lattice",
@@ -73,7 +73,7 @@ def register():
             default=0.05, min=0.0, max=1.0
         )
 
-    # ── 서브모듈 등록 (순서: layers → wiggle_2 → ui → lattice) ─
+    # -- Register submodules (order: layers -> wiggle_2 -> ui -> lattice)
     for mod in (physics_logic, wiggle_layers, wiggle_2, ui_panel, wiggle_lattice_visual):
         try:
             mod.register()

@@ -73,13 +73,22 @@ class WIGGLE_PT_Settings(WigglePanel, bpy.types.Panel):
                 if hasattr(pb, "wiggle_limit_z"):
                     col.prop(pb, "wiggle_limit_z", text="Z (right and left)")
             else:
-                # Emergency Fallback: If Blender 5.1.2 internal registry lags, show graceful warning instead of crash
+                # Bug fix: the previous fallback tried drawing the raw
+                # ID-property path ('["wiggle_angle_limit"]') whenever
+                # hasattr was False, meant to cover a Blender internal
+                # registry lag seen on 5.1.2 - on 5.2 that raw-path draw
+                # itself was reported to render as a broken "cannot
+                # retrieve"-style field instead of a usable number
+                # (rather than the intended graceful warning). Since
+                # registration now happens before any class/panel is
+                # registered (see register() below), hasattr should
+                # always be True by the time this ever draws - if it
+                # somehow isn't, fail safely with a plain label instead
+                # of attempting the raw path that broke on 5.2.
                 if hasattr(pb, "wiggle_angle_limit"):
                     inner_box.prop(pb, "wiggle_angle_limit", text="Total Limit")
-                elif "wiggle_angle_limit" in pb.keys():
-                    inner_box.prop(pb, '["wiggle_angle_limit"]', text="Total Limit")
                 else:
-                    inner_box.label(text="Total Limit property not loaded yet.", icon='INFO')
+                    inner_box.label(text="Total Limit property not loaded yet - try Reload Scripts.", icon='INFO')
 
 
 class WIGGLE_PT_SimMixLayer_v3(bpy.types.Panel):
@@ -92,19 +101,32 @@ class WIGGLE_PT_SimMixLayer_v3(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        # [수정] 포즈 본이 아닌 활성 오브젝트를 가져옵니다.
+        # Fix: use the active object, not the pose bone.
         obj = context.active_object
-        
-        # 오브젝트가 없거나, 리스트 속성이 없는 경우를 대비한 예외 처리
+
+        # Guard against no object selected, or no list property present.
         if not obj:
             layout.label(text="No active object selected")
             return
 
-        # 1. 상단: 레이어 리스트 (Object의 wiggle_layers 참조)
+        # Bug fix (UX): sync_layers() intentionally refuses to touch NLA
+        # structure while a strip is in NLA Tweak Mode (e.g. from double-
+        # clicking a strip in the NLA editor), to avoid corrupting
+        # Blender's own tweak-mode bookkeeping. That also means Layer
+        # Weight silently stops doing anything visible until tweak mode
+        # is exited, with no indication why - moving the slider looked
+        # completely broken. Surface it clearly with a one-click fix.
+        if obj.animation_data and getattr(obj.animation_data, "use_tweak_mode", False):
+            warn = layout.box()
+            warn.alert = True
+            warn.label(text="NLA Tweak Mode is active - Layer Weight is frozen", icon='ERROR')
+            warn.operator("wiggle.exit_tweak_mode", icon='LOOP_BACK')
+
+        # 1. Top: layer list (references the Object's wiggle_layers).
         row = layout.row()
-        # [수정] pb 대신 obj를 사용합니다.
+        # Fix: use obj instead of pb.
         row.template_list("WIGGLE_UL_SimMixLayers", "", obj, "wiggle_layers", obj, "wiggle_layer_index")
-        
+
         col = row.column(align=True)
         col.operator("wiggle.layer_action", icon='ADD', text="").action = 'ADD'
         col.operator("wiggle.layer_action", icon='REMOVE', text="").action = 'REMOVE'
@@ -112,39 +134,43 @@ class WIGGLE_PT_SimMixLayer_v3(bpy.types.Panel):
         col.operator("wiggle.layer_action", icon='TRIA_UP', text="").action = 'UP'
         col.operator("wiggle.layer_action", icon='TRIA_DOWN', text="").action = 'DOWN'
 
-        # 2. 하단 상세 설정 박스
+        # 2. Bottom: detail settings box.
         if hasattr(obj, "wiggle_layers") and len(obj.wiggle_layers) > 0:
             active_layer = obj.wiggle_layers[obj.wiggle_layer_index]
             box = layout.box()
             box.label(text=f"Mix Settings: {active_layer.name}", icon='SETTINGS')
-            
-            # [입력 1] 레이어 적용 확률
+
+            # Input 1: layer blend weight.
             row = box.row(align=True)
             row.prop(active_layer, "influence", text="Layer Weight (%)", slider=True)
-            
-            # [입력 2] 해당 레이어의 실제 물리 강도
+
+            # Input 2: this layer's actual physics strength.
             row = box.row(align=True)
             row.prop(active_layer, "sim_mix", text="Sim Mix (Physics)", slider=True)
-            # 오브젝트 모드용 오퍼레이터로 이름이 동일하다면 유지, 다르다면 확인 필요
+            # Kept the same operator name for the object-mode variant; recheck if it diverges.
             row.operator("wiggle.apply_mix_to_chain", text="", icon='LINKED')
-            
-            # 레이어 타입 선택
+
+            # Layer type selection.
             row = box.row(align=True)
             row.prop(active_layer, "type", expand=True)
 
-            # 모든 Sim 레이어(mute 아닌)의 Layer Weight × Sim Mix를 합산한
-            # 최종 실시간 물리 강도를 보여줌 (0=애니메이션만, 1=물리 100%).
+            # Shows the final live physics strength as the sum of
+            # (Layer Weight x Sim Mix) across every non-muted Sim layer
+            # (0=animation only, 1=full physics).
             if obj.type == 'ARMATURE' and hasattr(obj, "wiggle_layers") and obj.wiggle_layers:
                 pb_dbg = next((pb for pb in obj.pose.bones
                                if getattr(pb, "wiggle_tail", False) or getattr(pb, "wiggle_head", False)), None)
                 if pb_dbg:
                     box.label(text=f"Live physics strength = {pb_dbg.wiggle_influence:.3f}", icon='INFO')
 
-            # 3. 최종 베이크 버튼
-            layout.separator()
-            row = layout.row()
-            row.scale_y = 1.2
-            row.operator("wiggle.bake_combined", icon='RENDER_ANIMATION', text="Bake Result C")
+            # Layout: bake settings/button used to sit right here, in the
+            # middle of the Sim Mix Layers panel. That made this panel
+            # long and pushed every other panel (Safety/Head/Tail/
+            # Utilities) further down, making them harder to find. Moved
+            # to Global Utilities > Loop Physics (renamed "Bake"), right
+            # below the Loop Physics toggle, to match the actual workflow
+            # order (set up layers -> tune physics -> loop -> bake) and
+            # keep this panel short.
         else:
             layout.label(text="Add a layer to start", icon='INFO')
 
@@ -153,12 +179,14 @@ class WIGGLE_PT_SimMixLayer_v3(bpy.types.Panel):
 
 
 # ----------------------------------------------------------------
-# 이 오퍼레이터는 별도의 파일이나 wiggle_2.py의 register 부분에 있어야 합니다.
+# This operator should live either in a separate file or in wiggle_2.py's
+# register section.
 # ----------------------------------------------------------------
 class WIGGLE_OT_ApplyMixToChain(bpy.types.Operator):
-    """모든 Sim Mix 레이어(Layer Weight x Sim Mix)를 합산해 이 오브젝트의
-    모든 위글 본에 즉시 다시 적용하고, 타임라인을 안 건드리고도 뷰포트를
-    새 값으로 갱신합니다."""
+    """Sums (Layer Weight x Sim Mix) across every Sim Mix layer and
+    re-applies it immediately to all wiggle bones on this object,
+    refreshing the viewport with the new values without touching the
+    timeline."""
     bl_idname = "wiggle.apply_mix_to_chain"
     bl_label = "Refresh Physics Mix"
     bl_options = {'REGISTER', 'UNDO'}
@@ -325,52 +353,57 @@ class WIGGLE_PT_Utilities(WigglePanel, bpy.types.Panel):
 
                 
         if hasattr(scene, "wiggle"):
-            # [중복 제거] Loop Physics 토글은 Bake 패널의 scene.wiggle_use_loop
-            # 하나로 통일됨 (wiggle_post의 리셋 로직에 실제로 연결됨).
-            # scene.wiggle.loop 는 미사용 레거시 필드로 남겨둠 (하위호환).
+            # Deduplicated: the Loop Physics toggle is now unified with
+            # the Bake panel's scene.wiggle_use_loop (which actually wires
+            # into wiggle_post's reset logic). scene.wiggle.loop is kept
+            # around as an unused legacy field for backward compatibility.
             layout.prop(scene.wiggle, 'iterations', text="Quality")
 
 class WIGGLE_PT_Bake(WigglePanel, bpy.types.Panel):
+    # Cleanup: bake settings/button and Disk Point Cache used to live
+    # inside the Sim Mix Layers panel (see WIGGLE_PT_SimMixLayer_v3),
+    # which made that panel long and pushed every panel after it further
+    # down. Moved everything bake-related here, below the Loop Physics
+    # toggle, to match the actual workflow order (set up layers -> tune
+    # physics -> loop -> bake) and to keep it all in one predictable
+    # place at the end.
     bl_label = 'Bake'
     bl_parent_id = 'WIGGLE_PT_Utilities'
     bl_options = {"DEFAULT_CLOSED"}
-    
+
     def draw(self, context):
         layout = self.layout
         if not hasattr(context.scene, "wiggle"): return
-        
+
         scene = context.scene
         w = scene.wiggle
         layout.use_property_split = True
 
-        # Loop Physics 설정
+        # Loop Physics setting.
         layout.prop(scene, "wiggle_use_loop", text="Loop Physics", icon='LOOP_FORWARDS', toggle=True)
+
         layout.separator()
+        bake_box = layout.box()
+        bake_box.label(text="Bake", icon='RENDER_ANIMATION')
+        bake_box.use_property_split = True
+        bake_box.prop(w, 'preroll')
+        bake_box.prop(w, 'bake_overwrite')
+        nla_row = bake_box.row()
+        nla_row.enabled = not w.bake_overwrite
+        nla_row.prop(w, 'bake_nla')
+        bake_row = layout.row()
+        bake_row.scale_y = 1.2
+        bake_row.operator("wiggle.bake_combined", icon='RENDER_ANIMATION', text="Bake Result C")
 
-        # 기존 베이크 설정들
-        layout.prop(w, 'preroll')
-        layout.prop(w, 'bake_overwrite')
-        
-        row = layout.row()
-        row.enabled = not w.bake_overwrite
-        row.prop(w, 'bake_nla')
-        
-        # [수정 부분] 기존 wiggle.bake 대신 물리 끄기 로직이 포함된 bake_combined 호출
-        if hasattr(bpy.ops.wiggle, 'bake_combined'):
-            layout.operator('wiggle.bake_combined', text="Bake (with Auto-Off)", icon='REC')
-        elif hasattr(bpy.ops.wiggle, 'bake'):
-            layout.operator('wiggle.bake', icon='REC')
-
-        # --- 포인트 캐시 (디스크) ---
         if hasattr(scene, "wiggle_cache_enable"):
             layout.separator()
-            box = layout.box()
-            box.label(text="Disk Point Cache (for scrubbing)", icon='FILE_CACHE')
-            box.prop(scene, "wiggle_cache_dir", text="Directory")
-            box.prop(scene, "wiggle_cache_enable", text="Use Cache During Playback")
-            row = box.row(align=True)
-            row.operator("wiggle.bake_cache", icon='REC')
-            row.operator("wiggle.clear_cache", icon='TRASH')
+            cache_box = layout.box()
+            cache_box.label(text="Disk Point Cache (for scrubbing)", icon='FILE_CACHE')
+            cache_box.prop(scene, "wiggle_cache_dir", text="Directory")
+            cache_box.prop(scene, "wiggle_cache_enable", text="Use Cache During Playback")
+            cache_row = cache_box.row(align=True)
+            cache_row.operator("wiggle.bake_cache", icon='REC')
+            cache_row.operator("wiggle.clear_cache", icon='TRASH')
 
 
 class WIGGLE_PT_Safety(WigglePanel, bpy.types.Panel):
@@ -434,33 +467,31 @@ class WIGGLE_PT_Safety(WigglePanel, bpy.types.Panel):
 # --- REGISTRATION ---
 
 classes = (
-    WIGGLE_PT_Settings,          # 메인 부모 패널
-    WIGGLE_PT_SimMixLayer_v3,    # [수정] 오브젝트 모드 대응 패널
-    WIGGLE_PT_Safety,            # 세이프티 가드 패널
-    WIGGLE_PT_Head,              # 헤드 설정 패널
-    WIGGLE_PT_Tail,              # 테일 설정 패널
-    WIGGLE_PT_Utilities,         # 유틸리티 부모 패널
-    WIGGLE_PT_Bake,              # 베이크 패널
-    
-    WIGGLE_OT_ApplyMixToChain,    # 오퍼레이터
+    WIGGLE_PT_Settings,          # main parent panel
+    WIGGLE_PT_SimMixLayer_v3,    # fix: object-mode-aware panel
+    WIGGLE_PT_Safety,            # safety guard panel
+    WIGGLE_PT_Head,              # head settings panel
+    WIGGLE_PT_Tail,              # tail settings panel
+    WIGGLE_PT_Utilities,         # utilities parent panel
+    WIGGLE_PT_Bake,              # bake panel
+
+    WIGGLE_OT_ApplyMixToChain,    # operator
 )
 
 def register():
-    # 1. 클래스 등록
-    for cls in classes:
-        # [버그 수정] hasattr(bpy.types, cls.__name__)로 "이미 등록됐는지"를
-        # 가리려 했지만, Blender 5.x에서 실측한 결과 Operator/Panel
-        # 클래스는 실제 등록 여부와 무관하게 이 hasattr가 항상 False다
-        # (register_class/bpy.ops 자체는 정상 동작). 그래서 이 가드는
-        # 아무 역할도 못 했고, 재등록(Reload Scripts 등) 시
-        # "already registered" 예외만 만들었다. try/except로 실제 예외
-        # 발생 여부를 기준으로 판단한다.
-        try:
-            bpy.utils.register_class(cls)
-        except (RuntimeError, ValueError) as e:
-            pass
-
-    # 2. 씬(Scene) 단위 속성 등록
+    # Bug fix: properties (Scene/PoseBone) used to be registered AFTER
+    # the panel/operator classes below. In normal single-threaded
+    # execution register() always finishes before Blender's event loop
+    # can trigger a redraw, so this shouldn't matter - but users have
+    # reported Total Limit intermittently showing a broken "cannot
+    # retrieve"-style field on Blender 5.2 right after enabling the
+    # addon, which didn't happen on 5.1. That could only happen if a
+    # panel draws while wiggle_angle_limit isn't registered on
+    # PoseBone yet, which points at some difference in how 5.2's
+    # extension loader sequences registration/redraws versus 5.1's.
+    # Registering properties first removes that window entirely,
+    # regardless of the exact cause.
+    # 1. Register Scene-level properties.
     bpy.types.Scene.wiggle_adaptive_damping = bpy.props.BoolProperty(
         name="Safety Guard", default=True, 
         description="Automatic Bone Pop Prevention"
@@ -484,8 +515,8 @@ def register():
         default='BOX'
     )
 
-    # 3. 본(PoseBone) 단위 속성 등록
-    # wiggle_influence 는 wiggle_layers.py 에서 등록 (default=1.0). 중복 등록 금지.
+    # 2. Register PoseBone-level properties.
+    # wiggle_influence is registered in wiggle_layers.py (default=1.0). Do not register it again here.
     bpy.types.PoseBone.wiggle_use_individual_limits = bpy.props.BoolProperty(
         name="Use Individual Limits", default=False,
         description="Set X/Z limits separately. (Alt + Click to sync.)"
@@ -505,20 +536,37 @@ def register():
         description="Clamp how far the floating head may drift from its animated rest position (0 = unlimited)"
     )
 
+    # 3. Register classes (panels/operators), now that every property
+    # they might draw on their very first invocation already exists.
+    for cls in classes:
+        # Bug fix: hasattr(bpy.types, cls.__name__) was meant to check
+        # "is this already registered", but measured directly on
+        # Blender 5.x, this hasattr is always False for Operator/Panel
+        # classes regardless of actual registration state
+        # (register_class/bpy.ops themselves work fine). So this guard
+        # never did anything, and just produced "already registered"
+        # exceptions on re-registration (Reload Scripts, etc). Use
+        # try/except and judge by the actual exception instead.
+        try:
+            bpy.utils.register_class(cls)
+        except (RuntimeError, ValueError) as e:
+            pass
+
 def unregister():
-    # 1. 클래스 해제
-    # [버그 수정] hasattr(bpy.types, cls.__name__) 가드는 Blender 5.x에서
-    # Operator/Panel 클래스의 실제 등록 여부를 전혀 반영하지 못해서(항상
-    # False), 이 오퍼레이터/패널이 실제로는 unregister_class 되지 않고
-    # 계속 남아있었다. 애드온을 껐다 켜면 "already registered as a
-    # subclass"로 재등록이 실패하는 원인. try/except로 바꾼다.
+    # 1. Unregister classes.
+    # Bug fix: the hasattr(bpy.types, cls.__name__) guard doesn't reflect
+    # actual Operator/Panel registration state at all on Blender 5.x
+    # (always False), so this operator/panel never actually got
+    # unregister_class'd and stuck around. This was the cause of
+    # "already registered as a subclass" failing re-registration after
+    # disabling and re-enabling the addon. Switched to try/except.
     for cls in reversed(classes):
         try:
             bpy.utils.unregister_class(cls)
         except (RuntimeError, ValueError):
             pass
 
-    # 2. 씬 속성 삭제
+    # 2. Delete Scene properties.
     props_scene = [
         "wiggle_adaptive_damping", "wiggle_safety_threshold", "wiggle_safety_rot_threshold",
         "wiggle_use_loop", "wiggle_guide_shape"
@@ -526,7 +574,7 @@ def unregister():
     for p in props_scene:
         if hasattr(bpy.types.Scene, p): delattr(bpy.types.Scene, p)
 
-    # 3. 본 속성 삭제
+    # 3. Delete PoseBone properties.
     props_bone = [
         "wiggle_use_individual_limits",
         "wiggle_angle_limit", "wiggle_limit_x", "wiggle_limit_z", "wiggle_max_offset_head"
