@@ -3,6 +3,125 @@ from bpy.app.handlers import persistent
 from mathutils import Vector, Matrix, Quaternion, noise
 from . import wiggle_cache
 
+# ── Cache serialization helpers ───────────────────────────────────────────────
+# mathutils.Vector / Quaternion / Matrix cannot be pickled directly.
+# These helpers convert them to plain Python tuples before saving and
+# restore them as Vector instances after loading.
+
+def _vec_to_tuple(v):
+    """
+    Convert any sequence to a flat tuple of floats.
+    Handles: Vector, flat float arrays, AND nested sequences (Matrix rows).
+    """
+    result = []
+    for x in v:
+        try:
+            result.append(float(x))
+        except (TypeError, ValueError):
+            # x is itself iterable (e.g. a Vector row inside a Matrix)
+            for y in x:
+                result.append(float(y))
+    return tuple(result)
+
+def _serialize_bone_cache(bw):
+    """
+    Flatten all Vector/Matrix fields of a WiggleBone PropertyGroup into
+    plain Python types that pickle can handle.
+
+    bw.matrix is a FloatVectorProperty(size=16, subtype='MATRIX').
+    In Blender 5.x the property getter may return a sequence of Vector
+    rows instead of a flat float array, so _vec_to_tuple flattens
+    both cases automatically.
+    """
+    # Safely read matrix: try as flat array first, fall back to per-element
+    try:
+        mat_flat = tuple(float(x) for x in bw.matrix)
+        if len(mat_flat) != 16:
+            raise ValueError("not 16 elements")
+    except (TypeError, ValueError):
+        # Nested rows path
+        mat_flat = _vec_to_tuple(bw.matrix)
+
+    return {
+        "position":             tuple(float(x) for x in bw.position),
+        "position_last":        tuple(float(x) for x in bw.position_last),
+        "velocity":             tuple(float(x) for x in bw.velocity),
+        "position_head":        tuple(float(x) for x in bw.position_head),
+        "position_last_head":   tuple(float(x) for x in bw.position_last_head),
+        "velocity_head":        tuple(float(x) for x in bw.velocity_head),
+        "collision_point":      tuple(float(x) for x in bw.collision_point),
+        "collision_normal":     tuple(float(x) for x in bw.collision_normal),
+        "collision_point_head": tuple(float(x) for x in bw.collision_point_head),
+        "collision_normal_head":tuple(float(x) for x in
+                                      getattr(bw, "collision_normal_head", (0.0, 0.0, 0.0))),
+        "matrix":               mat_flat,
+        "adaptive_damp_mod":    float(getattr(bw, "adaptive_damp_mod", 0.0)),
+    }
+
+def _deserialize_bone_cache(bw, data):
+    """Restore plain-tuple cache data back into a WiggleBone PropertyGroup.
+    [Bug fix] Every field is now read defensively (.get with fallbacks) so
+    cache files written by older versions - which stored only 7 of these
+    fields - can't raise KeyError on load."""
+    bw.position              = data.get("position", (0.0, 0.0, 0.0))
+    bw.position_last         = data.get("position_last",
+                                        data.get("position", (0.0, 0.0, 0.0)))
+    bw.velocity              = data.get("velocity", (0.0, 0.0, 0.0))
+    bw.position_head         = data.get("position_head", (0.0, 0.0, 0.0))
+    bw.position_last_head    = data.get("position_last_head",
+                                        data.get("position_head", (0.0, 0.0, 0.0)))
+    bw.velocity_head         = data.get("velocity_head", (0.0, 0.0, 0.0))
+    bw.collision_point       = data.get("collision_point", (0.0, 0.0, 0.0))
+    bw.collision_normal      = data.get("collision_normal", (0.0, 0.0, 0.0))
+    bw.collision_point_head  = data.get("collision_point_head", (0.0, 0.0, 0.0))
+    bw.collision_normal_head = data.get("collision_normal_head", (0.0, 0.0, 0.0))
+    bw.matrix                = data.get("matrix",
+                                        (1, 0, 0, 0,
+                                         0, 1, 0, 0,
+                                         0, 0, 1, 0,
+                                         0, 0, 0, 1))
+    bw.adaptive_damp_mod     = float(data.get("adaptive_damp_mod", 0.0))
+
+def _build_serializable_wo(ob, wo):
+    """
+    Build a pure-Python dict representing the wiggle state of all bones
+    in `wo`.  This is what gets pickled instead of the raw PropertyGroup.
+    """
+    bones_data = {}
+    for wb in wo.list:
+        b = ob.pose.bones.get(wb.name)
+        if b is None:
+            continue
+        bones_data[wb.name] = _serialize_bone_cache(b.wiggle)
+    return bones_data
+
+def _restore_wo_from_dict(ob, bones_data):
+    """Restore a previously serialized wo dict back into pose bone properties."""
+    for bone_name, data in bones_data.items():
+        b = ob.pose.bones.get(bone_name)
+        if b is None:
+            continue
+        _deserialize_bone_cache(b.wiggle, data)
+
+def all_frames_cached(scene, cf):
+    """True when the disk cache is enabled and every active wiggle object
+    already has `cf` on disk. Lets wiggle_post SKIP the hard reset on
+    backward jumps/frame_start so the cached pose is loaded directly -
+    previously the reset branch returned before the cache was consulted,
+    so scrubbing backwards always showed the un-wiggled rest pose.
+    Objects wiggle_post skips anyway (muted/frozen) are ignored here too."""
+    if not getattr(scene, "wiggle_cache_enable", False):
+        return False
+    if not scene.wiggle.list:
+        return False
+    for wo in scene.wiggle.list:
+        ob = scene.objects.get(wo.name)
+        if ob is None or ob.wiggle_mute or getattr(ob, "wiggle_freeze", False):
+            continue
+        if not wiggle_cache.has_frame(scene, ob.name, cf):
+            return False
+    return True
+
 ZERO = Vector((0, 0, 0))
 #return m2 in m1 space
 def relative_matrix(m1,m2):
@@ -154,6 +273,14 @@ def update_prop(self, context, prop):
         context.scene["wiggle_updating"] = False
 
 _GET_PARENT_CACHE = {}
+
+# Per-object transform trackers for the Adaptive Safety Guard.
+# [Bug fix] These were stored by assigning new attributes onto the
+# WiggleScene PropertyGroup (w.last_ob_pos = {}), but bpy_struct rejects
+# unknown attributes with AttributeError, crashing wiggle_post every
+# frame whenever Adaptive Damping was enabled.
+_LAST_OB_POS = {}
+_LAST_OB_ROT = {}
 
 # So the Sim Mix Layers' Layer Weight/Sim Mix sliders can refresh the preview
 # instantly without actually changing the current frame, this stores, per
@@ -1190,8 +1317,19 @@ def wiggle_post(scene, dg):
     is_playing = bool(bpy.context.screen and bpy.context.screen.is_animation_playing)
     is_natural_loop = loop_enabled and is_playing and cf <= scene.frame_start and lastframe >= scene.frame_end
 
+    # [Disk cache] Read once here so both the reset gate below and the
+    # per-object load in the main loop share the same value.
+    cache_enabled = getattr(scene, "wiggle_cache_enable", False)
+
     # 2. [Reset logic] - precisely target only the bones in the wiggle list, instead of iterating every bone
-    if not is_natural_loop and ((cf <= scene.frame_start) or (cf < lastframe)):
+    #    [Bug fix] When a complete disk cache exists for this frame, fall
+    #    through to the main loop (which loads the cached pose) instead of
+    #    hard-resetting and returning - the old gate returned before the
+    #    cache was ever consulted, so scrubbing/jumping backwards always
+    #    showed the un-wiggled rest pose even with the cache enabled.
+    if (not is_natural_loop
+            and ((cf <= scene.frame_start) or (cf < lastframe))
+            and not all_frames_cached(scene, cf)):
         for wo in w.list:
             ob = scene.objects.get(wo.name)
             if not ob: continue
@@ -1234,16 +1372,27 @@ def wiggle_post(scene, dg):
         # keyframes and overwriting the result.
         if not ob or ob.wiggle_mute or getattr(ob, "wiggle_freeze", False): continue
 
-        # [Feature added] Disk point cache - if a frame has already been
-        # computed, load and apply it directly instead of re-simulating
-        # (avoids re-simulating from frame_start every time when scrubbing
-        # the timeline).
-        cache_enabled = getattr(scene, "wiggle_cache_enable", False)
-        if cache_enabled and wiggle_cache.has_frame(scene, ob.name, cf):
-            if wiggle_cache.load_frame(scene, ob, wo):
+        # [Feature added] Disk point cache - load precomputed frames instead
+        # of re-simulating.
+        # [Bug fix] load_frame() is now a PURE READER returning the plain
+        # dict (or None on miss/corruption). The old version both wrote into
+        # PropertyGroups itself AND returned a bool, which meant the
+        # dict-based restore path below was dead code and only part of the
+        # state (7 of 12 fields - collision/sticky state lost) was ever
+        # restored.
+        if cache_enabled:
+            _cached = wiggle_cache.load_frame(scene, ob.name, cf)
+            if _cached is not None:
+                _restore_wo_from_dict(ob, _cached)
+                # Drop stale blend-cache entries so moving the Sim Mix slider
+                # afterwards can't re-apply rotations/locations belonging to a
+                # different frame on top of the freshly loaded pose.
+                for _key in [k for k in _LAST_BLEND_CACHE if k[0] == ob.name]:
+                    _LAST_BLEND_CACHE.pop(_key, None)
                 for wb in wo.list:
                     b = ob.pose.bones.get(wb.name)
-                    if b: update_matrix(b, True)
+                    if b:
+                        update_matrix(b, True)
                 ob.update_tag()
                 continue
 
@@ -1253,30 +1402,31 @@ def wiggle_post(scene, dg):
             sensitivity = getattr(scene, "wiggle_safety_threshold", 10.0)
 
             # 1. Detect movement speed (original)
-            if not hasattr(w, "last_ob_pos"): w.last_ob_pos = {}
+            # [Bug fix] These trackers now live in module-level dicts -
+            # assigning new attributes onto the WiggleScene PropertyGroup
+            # raised AttributeError and killed the handler every frame.
             current_pos = ob.matrix_world.translation.copy()
-            last_pos = w.last_ob_pos.get(ob.name, current_pos)
+            last_pos = _LAST_OB_POS.get(ob.name, current_pos)
             delta_move = current_pos - last_pos
             obj_speed = delta_move.length / w.dt if w.dt > 0 else 0
             threshold = 5.0
             if obj_speed > threshold:
                 safety_boost = (obj_speed - threshold) * sensitivity
-            w.last_ob_pos[ob.name] = current_pos
+            _LAST_OB_POS[ob.name] = current_pos
 
             # 2. [Added] Detect rotational speed - when a character spins
             # around quickly, position barely changes even though bone tips
             # (tails, hair) can travel a huge actual distance, which
             # position-based detection alone can't catch.
-            if not hasattr(w, "last_ob_rot"): w.last_ob_rot = {}
             current_rot = ob.matrix_world.to_quaternion()
-            last_rot = w.last_ob_rot.get(ob.name, current_rot)
+            last_rot = _LAST_OB_ROT.get(ob.name, current_rot)
             angle_delta = last_rot.rotation_difference(current_rot).angle
             angular_speed_deg = math.degrees(angle_delta) / w.dt if w.dt > 0 else 0
             rot_threshold = getattr(scene, "wiggle_safety_rot_threshold", 180.0)
             if angular_speed_deg > rot_threshold:
                 rot_boost = (angular_speed_deg - rot_threshold) * sensitivity * 0.1
                 safety_boost = max(safety_boost, rot_boost)
-            w.last_ob_rot[ob.name] = current_rot
+            _LAST_OB_ROT[ob.name] = current_rot
 
         active_bones = [ob.pose.bones.get(wb.name) for wb in wo.list
                         if ob.pose.bones.get(wb.name) and not ob.pose.bones.get(wb.name).wiggle_mute]
@@ -1385,7 +1535,9 @@ def wiggle_post(scene, dg):
             bw.position_last = bw.position.copy()
 
         if cache_enabled:
-            wiggle_cache.save_frame(scene, ob, wo, cf)
+            # Serialize Vector/Matrix fields to plain tuples before pickling
+            _serializable = _build_serializable_wo(ob, wo)
+            wiggle_cache.save_frame(scene, ob, _serializable, cf)
 
         ob.update_tag()
 
@@ -1757,19 +1909,31 @@ class WiggleBakeCache(bpy.types.Operator):
     def execute(self, context):
         scene = context.scene
         start, end = scene.frame_start, scene.frame_end
+        if end <= start:
+            self.report({'WARNING'}, "Empty frame range (start >= end).")
+            return {'CANCELLED'}
         original_frame = scene.frame_current
-        was_enabled = getattr(scene, "wiggle_cache_enable", False)
 
         wiggle_cache.clear_cache(scene)
         scene.wiggle_cache_enable = True
         try:
+            # [Bug fix] If the timeline was already parked on frame_start,
+            # frame_set(start) was a no-op and frame_change_post never fired
+            # for it. Hop to the opposite end first to guarantee a real
+            # frame change before walking the range.
+            scene.frame_set(end if original_frame == start else start)
             for f in range(start, end + 1):
                 scene.frame_set(f)
         finally:
-            scene.wiggle_cache_enable = was_enabled
+            # [Bug fix] Used to restore the previous toggle (usually False),
+            # throwing the bake away - the .wcache files existed but
+            # wiggle_post never looked at them. Leave it ON; that is the
+            # whole point of this operator.
+            scene.wiggle_cache_enable = True
             scene.frame_set(original_frame)
 
-        self.report({'INFO'}, f"Cached frames {start}-{end}")
+        self.report({'INFO'},
+                    f"Cached frames {start}-{end} -> {wiggle_cache.get_cache_dir(scene)}")
         return {'FINISHED'}
 
 
