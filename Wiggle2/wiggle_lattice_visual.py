@@ -203,6 +203,29 @@ class WiggleRTXHorizontalEngine:
 
         if not context.screen.is_animation_playing:
             return True
+        try:
+            from .wiggle_layers import NoAutoKey
+        except Exception:
+            NoAutoKey = None
+        if NoAutoKey is not None:
+            with NoAutoKey(context.scene):
+                return self._evaluate_physics_impl(context, current_stiffness, current_stretch)
+        return self._evaluate_physics_impl(context, current_stiffness, current_stretch)
+
+    def _evaluate_physics_impl(self, context, current_stiffness, current_stretch):
+        pose_bones = self.obj.pose.bones
+        mat_world = self.obj.matrix_world
+
+        # Frames loaded from the Wiggle disk cache are final; the lattice
+        # solver rotating bones on top of them would fight the cache.
+        scene = context.scene
+        if getattr(scene, "wiggle_cache_enable", False) or getattr(scene, "wiggle_auto_cache", False):
+            try:
+                from . import wiggle_cache
+                if wiggle_cache.has_frame(scene, self.obj.name, scene.frame_current):
+                    return True
+            except Exception:
+                pass
 
         mat_world_inv = mat_world.inverted()
 

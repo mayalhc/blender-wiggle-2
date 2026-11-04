@@ -15,61 +15,16 @@
 
 ---
 
-## 🆕 What's New in v2.2.9
+## 🆕 What's New in v2.4.0
 
-The headline fix this release: a bug that could **permanently disable simulation in a saved file, with zero indication anywhere why** — if you've had a file that mysteriously "went dead," this is almost certainly it, and it now fixes itself the moment you reopen the file. Also fixes two separate cases of the Layer Weight slider appearing to do nothing, and a Blender 5.2-specific display glitch on Total Limit.
+This update merges the September development branch into the main addon (Auto Cache, Auto Clean Reset, Field Collections, Smart Bake, modal bakes with progress/Esc cancel, auto-key protection, Copy performance, and NLA influence keyframe hygiene), and fixes two issues found during full runtime verification:
 
-*   **Fixed (critical): simulation could permanently stop working after a Hard Reset, even across saves and reloads.** The Hard Reset button briefly flags physics to pause while it resets every bone, then un-flags it when done — but if that reset hit any snag along the way (a bone that no longer existed, for example), it could stop partway through and leave physics flagged "paused" forever, with no checkbox or indicator anywhere showing this. Saving the file locked that broken state in permanently — every future reload would show a rig that just sits there doing nothing. Two fixes: Hard Reset can no longer get stuck this way, and **any file that was already affected now heals itself automatically the instant it's opened** — no manual fix needed.
-*   **Fixed: Layer Weight looking "stuck" once dragged down to 0%.** Dragging a layer's Weight slider all the way to 0 used to also mute its NLA track for efficiency — but Blender doesn't re-evaluate a muted track at all, so the Influence value shown in the NLA editor would visibly freeze at whatever it was right before hitting 0, making it look like the slider had stopped working. Weight now reads correctly all the way down to 0% at every step.
-*   **Fixed: Layer Weight silently frozen while a strip is being edited in the NLA editor.** If a strip was left open in NLA Tweak Mode (e.g. from a double-click), Layer Weight would stop affecting anything with no explanation. The Sim Mix Layers panel now shows a clear warning with a one-click "Exit NLA Tweak Mode" button whenever this happens.
-*   **Fixed (Blender 5.2): Total Limit could show a broken, unreadable field instead of a number.** A fallback path meant to paper over a rare Blender 5.1 registry timing quirk rendered incorrectly on 5.2 instead, showing an unusable field rather than the actual value. Property registration is now sequenced so this fallback should essentially never be needed, and the fallback itself now fails safely with a plain message instead of a broken field if it ever is.
+*   **Fixed (critical): playback could crash Blender 4.x / 5.0.x.** The auto clean reset re-evaluated the dependency graph from inside the frame-change handler, which could segfault Blender during playback start or rewinds on older versions. The rest pose is now derived directly, without re-entering the depsgraph.
+*   **Fixed: Adaptive Safety Guard did not react to fast motion.** Its per-object trackers are now stored as module-level state (the previous scene-property storage silently reset every frame), so movement/rotation detection works again.
+*   **Disk cache now stores the complete bone state** (collision/sticky info and the adaptive damping modifier), so cached frames restore everything the live simulation had. Older cache files are still accepted.
+*   **Bake to Disk Cache leaves "Use Cache During Playback" enabled** after a successful bake, so scrubbing uses the cache immediately.
 
----
-
-## 🆕 What's New in v2.2.8
-
-A correctness- and stability-focused release for Sim Mix Layers and Bake Result C, plus a UI reorganization aimed at making the panel layout easier to navigate.
-
-*   **Fixed: Bake Result C only captured wiggle-enabled bones.** "Combined" bakes were silently dropping every other bone in the rig — torso, limbs, anything driven by your Base animation that isn't itself a physics bone. A bake that looked self-contained actually wasn't: the moment Base was muted or its source action removed, all of those un-baked bones had nothing left driving them. Bake Result C now always bakes the entire armature, so the result is a genuinely complete, standalone action.
-*   **Fixed: a real crash — "Unable to add strip (the track does not have any space to accommodate this new strip)".** Could happen when the Base layer's internal NLA track already had a strip pointing at a different action than expected (e.g. left over from an earlier version, or after manually reassigning it). Fixed by reusing the existing strip instead of blindly trying to add a second one.
-*   **Fixed: manually changing the Base layer's linked action (via the NLA editor) kept reverting.** If you repointed the "WGL_Base" strip to a different action directly in the NLA editor, the very next sync (including every frame during playback) would silently change it back to whatever was originally cached. The strip's own action is now treated as the source of truth, so manual changes stick.
-*   **Fixed: deleting a layer's source action silently spawned a confusing replacement.** If you deleted an action that a Base or Sim layer still depended on (e.g. cleaning up "old" actions after baking), the addon used to quietly create a brand-new blank action in its place — including, on the Sim side, a bug that produced oddly-doubled action names (e.g. `Act_Sim_Act_Sim_...`) and an orphaned duplicate NLA track. The layer is now automatically muted instead, with a clear console message naming exactly which action went missing, so nothing is silently faked.
-*   **Fixed: "Overwrite Current Action" did nothing observable.** Bake Result C always created a brand-new "Bake" layer regardless of this checkbox — Overwrite only controlled whether that already-empty new action got cleared (a no-op). Overwrite now does what it says: with a Sim layer selected in the list, baking with Overwrite on writes directly into that layer's own action instead of creating a new one.
-*   **UI reorganization**: All bake-related controls (Preroll, Overwrite Current Action, Current Action to NLA, the Bake Result C button, and Disk Point Cache) have moved out of the Sim Mix Layers panel and into **Global Utilities → Bake**, positioned right below the Loop Physics toggle. This matches the actual workflow order (set up layers → tune physics → loop → bake) and keeps the Sim Mix Layers panel short, so Safety Guard / Head / Tail settings below it are easier to find without scrolling past a long bake section.
-
----
-
-## 🆕 What's New in v2.2.7
-
-A maintenance release focused on **addon lifecycle stability** and **Bake Result C safety**, plus a full audit pass across the codebase to remove leftover debug output and dead code.
-
-*   **Fixed: Disabling/re-enabling the addon (or Reload Scripts) could fail.** A version-compatibility issue in how operators/panels checked their own registration state meant that, on Blender 5.x, turning the addon off and back on — or using Blender's "Reload Scripts" — could throw "already registered as a subclass" errors and leave menus/panels in a broken state. Registration now uses proper error handling instead of an unreliable check, so enable/disable/reload cycles are clean.
-*   **Fixed: Bake Result C could overwrite your live Sim layer.** Baking used to write directly into the currently selected Sim layer's action. If that layer was still receiving new keyframes (or you baked twice), the bake could stomp on data you wanted to keep. **Bake Result C now always creates a brand-new Sim layer + action for its result** (named "Bake", "Bake 2", ...) and adds it straight into Sim Mix Layers, fully selected and ready to blend — your existing layers are never touched.
-*   **Fixed: A rare double-action bug during Bake Result C.** In some cases a single bake could create two action datablocks (e.g. "Bake" and "Bake.001") instead of one, due to a property-update ordering issue. Bake now creates exactly one action per bake.
-*   **Fixed: Dope Sheet action selection disappearing during playback.** Selecting a layer's action in the Dope Sheet/Action Editor and pressing Play could cause the selection to silently clear itself, traced to two separate leftover pieces of internal sync logic. Both have been removed — your action selection now survives playback.
-*   **Fixed: `Select Enabled` not updating the active bone.** Clicking Select Enabled correctly selected wiggle-enabled bones, but left the properties panel showing a stale bone's settings, which could cause the next checkbox edit to apply to the wrong bone. The active bone is now updated to a genuinely-selected wiggle bone.
-*   **Fixed: Angle Limit precision bug.** A duplicate/conflicting property definition for Total Limit between two files has been cleaned up to a single source of truth.
-*   **Cleanup**: Removed a per-frame handler that did nothing but walk every armature and bone in the scene every frame (dead code, no behavior change). Removed leftover debug console print statements (Horizontal Lattice rebuild logging). `unregister()` now properly cleans up all custom properties this addon adds to Scene/Object/Bone, so disabling the addon leaves no residue.
-
----
-
-## 🆕 What's New in v2.2.6
-
-This update is focused entirely on **stability and reliability**. A full pass was made through every setting in the UI to make sure each slider and toggle actually does what its label says — several controls that looked correct in the panel but silently did nothing (or did the wrong thing) have been fixed. No workflow changes are required; your existing rigs and settings will simply behave more correctly after updating.
-
-*   **Fixed: Total Limit ignored at higher Quality.** This was the headline bug. Raising the **Quality** slider (Sim Mix Layers → Bake settings) used to let bones swing far past their **Total Limit** — e.g. a 10° limit could visibly bend 90°. The limit is now enforced correctly no matter how high Quality is set.
-*   **Fixed: Freeze/Mute toggles that did nothing.** The Object/Bone **Freeze** icon and the new **Tail/Head Mute** icons (see below) now actually pause physics instead of being cosmetic.
-*   **Fixed: Bounce had no effect.** The **Bounce** slider on collisions now genuinely reflects velocity off a collider instead of being ignored.
-*   **Fixed: Head-side Wind was silent.** Wind Objects assigned in **Head Settings** now actually push the head, matching Tail behavior.
-*   **Fixed: Loop Physics did nothing.** The **Loop Physics** toggle (Bake panel) is now a single, working control — enabling it makes physics continue seamlessly when your timeline loops back to the start during playback, instead of hard-resetting every loop.
-*   **Fixed: Bake settings were ignored.** **Preroll**, **Overwrite Current Action**, and **Current Action to NLA** in the Bake panel are now actually applied when you bake, instead of being decorative.
-*   **Fixed: Root/Tip Distribution sliders were static.** Dragging the Stiff/Damp **Root** and **Tip** values now updates the whole chain live, the same way the one-click Presets already did.
-*   **New: Self Collision.** Bones can now collide with each other on the same rig (capsule-to-capsule), so tails, hair bunches, and skirt panels stop passing through themselves. Opt-in, off by default.
-*   **New: Real Sphere / Box / Cylinder / Capsule colliders.** Collision shapes no longer need an actual mesh — pick a simple Empty or object, scale it, and it works as a solid collider directly.
-*   **New: Turbulence & Vortex wind fields.** In addition to plain Wind, you can now drive bones with Blender's Turbulence and Vortex force fields for more organic, swirling motion.
-*   **New: Disk Point Cache.** Long, expensive simulations can now be cached to disk frame-by-frame, so scrubbing the timeline instantly loads cached results instead of re-simulating from frame 1 every time.
-*   **Improved: Horizontal Lattice Stabilizer.** Fixed incorrect bone pairing (it was linking unrelated bones across different chains), added multi-armature support, and added a Stretch Tolerance setting so the stabilizer resists snapping.
-*   **Improved: Adaptive Safety Guard.** Now also reacts to fast spinning motion (Rotation Threshold), not just fast linear movement, catching more types of explosive jitter.
+**Reference — Gunvaldis Urtāns:** The September update this release builds on was provided by Gunvaldis Urtāns (September 23 messages): the revised build with the **Auto Reset on Rewind** option, plus the fix so **Layer Weight no longer keyframes itself while Auto Key is on**. Both are fully incorporated in this release. Thank you!
 
 ---
 
@@ -94,7 +49,7 @@ Together, they form a "Zero-Waste" ecosystem—from initial strand creation to t
 
 ---
 
-## 📖 User Guide: Wiggle 2 Physics v2.2.9
+## 📖 User Guide: Wiggle 2 Physics v2.4.0
 
 ### Step 1: Initializing your Physics Stack
 To begin using Wiggle 2 RTX, you must first define your animation and simulation layers. The system will not calculate physics until these layers are initialized.

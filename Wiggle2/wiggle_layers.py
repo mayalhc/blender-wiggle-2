@@ -36,13 +36,74 @@ from bpy.app.handlers import persistent
 # ============================================================
 
 
+
+class NoAutoKey:
+    """Temporarily turn off Blender's Auto Keying while the addon itself
+    changes bone transforms (physics, resets, layer syncing), so Blender
+    never records those changes as keyframes. The user's setting is
+    restored immediately afterwards."""
+    def __init__(self, scene):
+        self.ts = getattr(scene, "tool_settings", None) if scene else None
+        self.prev = None
+
+    def __enter__(self):
+        if self.ts is not None and getattr(self.ts, "use_keyframe_insert_auto", False):
+            self.prev = True
+            try:
+                self.ts.use_keyframe_insert_auto = False
+            except Exception:
+                self.prev = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.prev:
+            try:
+                self.ts.use_keyframe_insert_auto = True
+            except Exception:
+                pass
+        return False
+
 def set_strip_influence(strip, value):
     """Actually make an NLA strip's influence apply. Static (non-animated)
     influence is ignored by Blender's evaluator (verified by measurement),
     so this works around it by turning on use_animated_influence and
     inserting one CONSTANT keyframe for the value (holds flat across the
     whole strip)."""
-    strip.use_animated_influence = True
+    value = max(0.0, min(1.0, float(value)))
+
+    # Full weight needs no keyframe at all: with use_animated_influence
+    # OFF, Blender plays the strip at full strength (see Bug-1 above), so
+    # a layer at 100% is just a plain strip. That keeps layers at 100% from
+    # putting "Influence" keys in the Dope Sheet/timeline, which looked
+    # like the animation was being keyed.
+    if value >= 0.9999:
+        if strip.use_animated_influence:
+            strip.use_animated_influence = False
+        for existing in list(strip.fcurves):
+            if existing.data_path != 'influence':
+                continue
+            removed = False
+            remover = getattr(strip.fcurves, "remove", None)
+            if remover is not None:
+                try:
+                    remover(existing)
+                    removed = True
+                except Exception:
+                    removed = False
+            if not removed:
+                while existing.keyframe_points:
+                    existing.keyframe_points.remove(existing.keyframe_points[0])
+                existing.update()
+            break
+        return
+
+    # Below 100%: Blender only applies a custom strip influence through an
+    # animated influence curve, so one CONSTANT key is genuinely needed.
+    # Only flip the flag when needed: turning it on makes Blender create
+    # the influence F-curve (and a key), so re-setting it every frame is
+    # pointless churn.
+    if not strip.use_animated_influence:
+        strip.use_animated_influence = True
     fc = None
     for existing in strip.fcurves:
         if existing.data_path == 'influence':
@@ -60,10 +121,25 @@ def set_strip_influence(strip, value):
     # when this function touched a strip that already had multiple
     # animated-influence keyframes (e.g. adopting an existing NLA track
     # as Base).
+    # sync_layers() calls this on EVERY frame change. It used to delete and
+    # re-insert the key each time, which made a fresh (selected, yellow)
+    # keyframe pop up in the timeline on every frame during playback and
+    # looked exactly like auto-keying. If the single key is already right,
+    # leave it alone.
+    pts = fc.keyframe_points
+    if (len(pts) == 1
+            and abs(pts[0].co[0] - strip.frame_start) < 1e-4
+            and abs(pts[0].co[1] - value) < 1e-6
+            and pts[0].interpolation == 'CONSTANT'):
+        return
     while fc.keyframe_points:
         fc.keyframe_points.remove(fc.keyframe_points[0])
     kp = fc.keyframe_points.insert(strip.frame_start, value)
     kp.interpolation = 'CONSTANT'
+    # Not selected, so it doesn't stand out as a "new" key in the timeline.
+    kp.select_control_point = False
+    kp.select_left_handle = False
+    kp.select_right_handle = False
     fc.update()
 
 
@@ -109,7 +185,9 @@ def _sync_strip_range(track, action):
     if strip.action_frame_start == a_start and strip.action_frame_end == a_end:
         return strip
     blend_type = strip.blend_type
-    influence = strip.influence
+    # With animated influence off the strip plays at full strength, and
+    # strip.influence may hold a stale value, so treat it as 1.0.
+    influence = strip.influence if strip.use_animated_influence else 1.0
     track.strips.remove(strip)
     new_strip = track.strips.new(action.name, int(a_start), action)
     new_strip.blend_type = blend_type
@@ -608,7 +686,8 @@ def wiggle_frame_change_handler(scene):
         return
     obj = bpy.context.object
     if obj and obj.type == 'ARMATURE' and hasattr(obj, "wiggle_layers") and obj.wiggle_layers:
-        sync_layers(obj)
+        with NoAutoKey(scene):
+            sync_layers(obj)
 
 
 def update_layer_params(self, context):
@@ -803,75 +882,248 @@ class WIGGLE_OT_LayerAction(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class WIGGLE_OT_BakeCombined(bpy.types.Operator):
+# ============================================================
+# Bake progress (shared by the modal bake operators)
+# ------------------------------------------------------------
+# A plain for-loop over scene.frame_set() blocks Blender's event loop,
+# so nothing can redraw until the bake is over (it looks frozen). The
+# bake operators below run as modal operators instead: each timer tick
+# processes as many frames as fit in a short time budget, then hands
+# control back so Blender can redraw the viewport, the status bar and
+# the progress bar in the Bake panel. Esc cancels.
+# ============================================================
+import time
+
+_bake_modal_running = False
+
+
+def bake_running():
+    return _bake_modal_running
+
+
+def _redraw_ui(context):
+    wm = context.window_manager
+    for win in wm.windows:
+        scr = win.screen
+        if not scr:
+            continue
+        for area in scr.areas:
+            if area.type in {'VIEW_3D', 'PROPERTIES', 'DOPESHEET_EDITOR',
+                             'GRAPH_EDITOR', 'NLA_EDITOR', 'TIMELINE'}:
+                area.tag_redraw()
+
+
+def _set_status(context, text):
+    ws = getattr(context, "workspace", None)
+    if ws:
+        try:
+            ws.status_text_set(text)
+        except Exception:
+            pass
+
+
+def bake_progress_begin(context, total, label):
+    global _bake_modal_running
+    _bake_modal_running = True
+    wm = context.window_manager
+    wm.wiggle_bake_progress = 0.0
+    wm.wiggle_bake_status = label
+    try:
+        wm.progress_begin(0, max(1, total))
+    except Exception:
+        pass
+    _set_status(context, f"{label}  (Esc to cancel)")
+    _redraw_ui(context)
+
+
+def bake_progress_update(context, done, total, label, can_cancel=True):
+    wm = context.window_manager
+    frac = (done / total) if total else 1.0
+    wm.wiggle_bake_progress = min(max(frac, 0.0), 1.0)
+    wm.wiggle_bake_status = label
+    try:
+        wm.progress_update(done)
+    except Exception:
+        pass
+    hint = "  (Esc to cancel)" if can_cancel else ""
+    _set_status(context, f"{label}  {int(frac * 100)}%{hint}")
+    _redraw_ui(context)
+
+
+def bake_progress_end(context):
+    global _bake_modal_running
+    _bake_modal_running = False
+    wm = context.window_manager
+    wm.wiggle_bake_progress = 0.0
+    wm.wiggle_bake_status = ""
+    try:
+        wm.progress_end()
+    except Exception:
+        pass
+    _set_status(context, None)
+    _redraw_ui(context)
+
+
+class ModalBakeMixin:
+    """Runs a bake as a list of small steps. Subclasses implement:
+      _bake_prepare(context) -> bool   set up and fill self._steps
+      _bake_step(context, step)        do one step
+      _bake_label(step) -> str         text for the status bar / panel
+      _bake_can_cancel(step) -> bool   False once cancelling is unsafe
+      _bake_finish(context) -> set     wrap up, return {'FINISHED'}
+      _bake_abort(context)             undo / restore after cancel or error
+    Clicking the button runs invoke() (modal, with progress). Calling the
+    operator from a script runs execute() (the same steps, synchronously)."""
+
+    _timer = None
+    _index = 0
+    _steps = ()
+    _TIME_BUDGET = 0.05  # seconds of work per tick before redrawing
+
+    @classmethod
+    def poll(cls, context):
+        return not _bake_modal_running
+
+    def execute(self, context):
+        if not self._bake_prepare(context):
+            return {'CANCELLED'}
+        try:
+            for step in self._steps:
+                self._bake_step(context, step)
+        except Exception:
+            self._bake_abort(context)
+            raise
+        return self._bake_finish(context)
+
+    def invoke(self, context, event):
+        if not self._bake_prepare(context):
+            return {'CANCELLED'}
+        self._index = 0
+        if not self._steps:
+            return self._bake_finish(context)
+        wm = context.window_manager
+        bake_progress_begin(context, len(self._steps), self._bake_label(self._steps[0]))
+        self._timer = wm.event_timer_add(0.01, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def _stop_modal(self, context):
+        if self._timer is not None:
+            try:
+                context.window_manager.event_timer_remove(self._timer)
+            except Exception:
+                pass
+            self._timer = None
+        bake_progress_end(context)
+
+    def modal(self, context, event):
+        total = len(self._steps)
+        cur = self._steps[min(self._index, total - 1)]
+
+        if event.type == 'ESC' and event.value == 'PRESS':
+            if self._bake_can_cancel(cur):
+                self._stop_modal(context)
+                try:
+                    self._bake_abort(context)
+                finally:
+                    self.report({'WARNING'}, "Wiggle bake cancelled")
+                return {'CANCELLED'}
+            return {'RUNNING_MODAL'}
+
+        if event.type != 'TIMER':
+            # Swallow other input so clicks/scrubbing can't interfere
+            # with the bake while it runs.
+            return {'RUNNING_MODAL'}
+
+        deadline = time.perf_counter() + self._TIME_BUDGET
+        try:
+            while self._index < total:
+                self._bake_step(context, self._steps[self._index])
+                self._index += 1
+                if time.perf_counter() >= deadline:
+                    break
+        except Exception as e:
+            self._stop_modal(context)
+            try:
+                self._bake_abort(context)
+            finally:
+                self.report({'ERROR'}, f"Wiggle bake failed: {e}")
+            return {'CANCELLED'}
+
+        if self._index >= total:
+            self._stop_modal(context)
+            return self._bake_finish(context)
+
+        nxt = self._steps[self._index]
+        bake_progress_update(context, self._index, total,
+                             self._bake_label(nxt), self._bake_can_cancel(nxt))
+        return {'RUNNING_MODAL'}
+
+
+class WIGGLE_OT_BakeCombined(ModalBakeMixin, bpy.types.Operator):
     """Bakes the live blended result of the active Sim layer into the
     action already linked to that layer. Honors the Bake panel's
-    Preroll/Overwrite/NLA settings."""
+    Preroll/Overwrite/NLA settings. Shows progress; press Esc to cancel"""
     bl_idname   = "wiggle.bake_combined"
     bl_label    = "Bake Combined"
     bl_options  = {'REGISTER', 'UNDO'}
 
-    def execute(self, context):
+    # ---------------------------------------------------------------
+    # Setup. Same behavior as the old single-pass execute(), with one
+    # change so Esc can cancel without losing data: an overwritten Sim
+    # layer's existing keys are no longer cleared before capture.
+    # Instead its NLA track is muted during capture (a muted track and an
+    # empty strip contribute exactly the same nothing to the evaluated
+    # pose), and the keys are only cleared right before writing.
+    # ---------------------------------------------------------------
+    def _bake_prepare(self, context):
         obj   = context.object
         scene = context.scene
         if not obj or obj.type != 'ARMATURE':
-            return {'CANCELLED'}
+            return False
 
-        # Bug fix (Base-off playback): this used to filter down to only
-        # bones with wiggle_head/wiggle_tail enabled (and not
-        # wiggle_mute'd). That meant every OTHER bone in the rig - torso,
-        # limbs, anything Base was driving that isn't a physics bone -
-        # never got a single keyframe written into the target action.
-        # "Bake Combined" looked self-contained (Base+Sim blended for the
-        # wiggle bones), but the moment Base was muted/disabled, all of
-        # those non-wiggle bones had nothing left driving them at all -
-        # which is exactly why a full-body selection + a separate bake
-        # was still required afterward to get a truly self-contained
-        # result. First fix attempt fell back to bpy.context.selected_pose_bones
-        # when nothing was selected, which still forced the user to
-        # manually select the whole armature in Pose Mode every time for
-        # the common case (bake the whole character). Bake Combined's
-        # whole point is to produce a self-contained action, so it should
-        # always target the entire armature - not depend on whatever
-        # happens to be selected in the viewport. Fix: ignore selection
-        # entirely and always bake every bone in obj.pose.bones.
-        bake_bones = list(obj.pose.bones)
-        if not bake_bones:
-            self.report({'WARNING'}, "No bones to bake.")
-            return {'CANCELLED'}
+        # Default: bake every bone, so the result is a self-contained action
+        # even with Base muted. Smart Bake: key only the active physics
+        # bones. The Sim layer's strip is REPLACE, and a REPLACE strip only
+        # overrides channels it has keys for, so every other bone falls
+        # through to Base untouched (non-destructive).
+        w_pre = scene.wiggle
+        self._smart = bool(getattr(w_pre, "bake_smart", False))
+        if self._smart:
+            names = [pb.name for pb in obj.pose.bones
+                     if (getattr(pb, "wiggle_tail", False)
+                         or (getattr(pb, "wiggle_head", False) and not pb.bone.use_connect))
+                     and not getattr(pb, "wiggle_mute", False)]
+            if not names:
+                self.report({'WARNING'}, "Smart Bake: no active wiggle bones to bake.")
+                return False
+        else:
+            names = [pb.name for pb in obj.pose.bones]
+            if not names:
+                self.report({'WARNING'}, "No bones to bake.")
+                return False
+        self._bake_bone_names = names
 
-        start_frame = scene.frame_start
-        end_frame   = scene.frame_end
-        orig_frame  = scene.frame_current
+        self._obj_name    = obj.name
+        self._start_frame = scene.frame_start
+        self._end_frame   = scene.frame_end
+        self._orig_frame  = scene.frame_current
         w = scene.wiggle
 
         if obj.mode != 'POSE':
             bpy.ops.object.mode_set(mode='POSE')
         if not obj.animation_data:
             obj.animation_data_create()
-        # Baking directly manipulates the active action - leave Tweak
-        # Mode first so it doesn't conflict with whatever strip might be
-        # currently open for editing.
         _exit_tweak_mode(obj)
 
-        # Fix: baking directly onto the currently selected Sim layer's
-        # action used to collide with that same action if it kept
-        # receiving new live-physics keyframes (Act_Sim_*) - it got
-        # overwritten mid-bake in an uncontrolled way. Base is of course
-        # never a valid target.
-        #
-        # Bug fix: "Overwrite Current Action" used to do nothing
-        # observable, because a brand-new action was always created
-        # regardless of the checkbox - the checkbox only controlled
-        # whether that already-empty new action got cleared (a no-op).
-        # Now: if Overwrite is on and a Sim layer is currently selected in
-        # the list, reuse that layer's action (clearing its existing
-        # keyframes) instead of creating a new layer. If Overwrite is off,
-        # or nothing valid is selected, fall back to creating a new layer
-        # (the safe, non-destructive default).
         layers = obj.wiggle_layers
-        idx = getattr(obj, "wiggle_layer_index", -1)
+        self._orig_layer_index = getattr(obj, "wiggle_layer_index", 0)
+        idx = self._orig_layer_index
         selected_layer = layers[idx] if 0 <= idx < len(layers) else None
+
+        # For cancel: remember what setup created so it can be removed.
+        self._created_layer = False
+        self._created_prev_track_name = None
 
         active_layer = None
         if getattr(w, "bake_overwrite", False) and selected_layer and selected_layer.type == 'SIM':
@@ -889,27 +1141,20 @@ class WIGGLE_OT_BakeCombined(bpy.types.Operator):
             while new_name in existing_names or bpy.data.actions.get(f"Act_Sim_{new_name}"):
                 n += 1
                 new_name = f"Bake {n}"
-
-            # Bug fix: influence/sim_mix have update=update_layer_params,
-            # so assigning them fires sync_layers() immediately. Assigning
-            # these before action_name is set caused ensure_layer_linked
-            # (inside sync_layers) to see "no action yet" and create a
-            # blank one right there, and then the next line created
-            # ANOTHER new action - ending up with two actions (e.g.
-            # Act_Sim_Bake and Act_Sim_Bake.001). Create and fully link
-            # the action first, and only then set influence/sim_mix, so
-            # sync_layers finds the already-existing action instead of
-            # making a new one.
+            # Link the action before touching influence/sim_mix (their
+            # update callback would otherwise create a second action).
             active_layer = layers.add()
             active_layer.type = 'SIM'
             active_layer.name = new_name
-
             target_action = bpy.data.actions.new(name=f"Act_Sim_{active_layer.name}")
             active_layer.action_name = target_action.name
-            # The track/strip need to exist before baking so it can be
-            # muted below.
             ensure_layer_linked(obj, active_layer, is_first=False)
+            self._created_layer = True
 
+        # Collection items can move when the collection changes, so keep
+        # names rather than references across modal ticks.
+        self._layer_name  = active_layer.name
+        self._action_name = target_action.name
         obj.wiggle_layer_index = list(layers).index(active_layer)
 
         if getattr(w, "bake_nla", False) and obj.animation_data.action:
@@ -917,132 +1162,217 @@ class WIGGLE_OT_BakeCombined(bpy.types.Operator):
             track = obj.animation_data.nla_tracks.new()
             track.name = "WGL_PrevAction"
             track.strips.new(old_action.name, int(old_action.frame_range[0]), old_action)
+            self._created_prev_track_name = track.name
 
-        # Always clear before writing the fresh bake result - a no-op on
-        # a brand-new action, a real overwrite on a reused one.
-        _clear_action_keyframes(target_action)
+        # Exclude the target layer's own (old) content from the capture.
+        target_track = _find_track_for_action(obj, target_action)
+        self._target_track_prev_mute = target_track.mute if target_track else None
+        if target_track:
+            target_track.mute = True
 
-        # Bug fix / core issue: this used to set
-        # obj.animation_data.action = target_action BEFORE the bake loop,
-        # then every frame did scene.frame_set() + view_layer.update()
-        # and immediately called keyframe_insert on that same action.
-        # Problem: Blender always evaluates the "active action" on top of
-        # the NLA stack with REPLACE at influence=1.0, regardless of any
-        # NLA track's mute state - a completely separate evaluation path.
-        # target_action starts empty, so frame 1 is fine, but the instant
-        # frame 1's keyframe gets inserted, target_action itself (as the
-        # active action) starts re-overriding that same channel - so from
-        # frame 2 onward, what got captured was not the true Base+Sim
-        # blend but "whatever was just baked for the previous frame"
-        # being reapplied (this matches exactly what was reported: "the
-        # result isn't Base+Sim combined, it's just the Sim/physics
-        # result" - the Base contribution progressively disappears as the
-        # bake locks onto the physics result). Fix: first, during a
-        # "read" pass, capture every frame's purely-evaluated pose values
-        # into a plain Python list without ever making target_action the
-        # active action (so there is no NLA self-reference / active-
-        # action overlay risk at all); only then, during a "write" pass,
-        # set the active action and write the captured values directly as
-        # keyframes per frame (this pass needs no re-evaluation, so the
-        # overlay problem can't occur).
         global _baking_in_progress
         _baking_in_progress = True
-        captured = []  # list of (frame, {bone_name: (loc, rot_mode, rot, scale)})
-        target_track = None
-        target_track_prev_mute = None
+        self._captured = []  # list of (frame, {bone_name: (loc, rot_mode, rot, scale)})
+        self._write_started = False
+
+        steps = []
+        self._has_preroll = getattr(w, "preroll", 0) > 0
         try:
-            if getattr(w, "preroll", 0) > 0:
-                w.is_preroll = True
-                preroll_start = start_frame - max(1, w.preroll)
-                for f in range(preroll_start, start_frame):
-                    scene.frame_set(f)
-                    context.view_layer.update()
-                w.is_preroll = False
+            from . import wiggle_2 as _w2
+            _w2._BAKE_NO_CACHE = self._has_preroll
+        except Exception:
+            pass
+        if self._has_preroll:
+            preroll_start = self._start_frame - max(1, w.preroll)
+            steps += [('PREROLL', f) for f in range(preroll_start, self._start_frame)]
+        steps += [('CAPTURE', f) for f in range(self._start_frame, self._end_frame + 1)]
+        steps.append(('BEGIN_WRITE', None))
+        steps += [('WRITE', i) for i in range(self._end_frame - self._start_frame + 1)]
+        self._steps = steps
+        return True
 
-            for f in range(start_frame, end_frame + 1):
-                scene.frame_set(f)
-                context.view_layer.update()
-                frame_data = {}
-                for pb in bake_bones:
-                    if pb.rotation_mode == 'QUATERNION':
-                        rot = pb.rotation_quaternion.copy()
-                    elif pb.rotation_mode == 'AXIS_ANGLE':
-                        rot = pb.rotation_axis_angle[:]
-                    else:
-                        rot = pb.rotation_euler.copy()
-                    frame_data[pb.name] = (pb.location.copy(), pb.rotation_mode, rot, pb.scale.copy())
-                captured.append((f, frame_data))
+    def _obj(self):
+        return bpy.data.objects.get(self._obj_name)
 
-            # Bug fix (Base+Sim combining): active_layer.influence used to
-            # be forced to 1.0 (and sim_mix to 0.0) BEFORE this capture
-            # loop ran. Since this layer's NLA strip uses blend_type
-            # REPLACE, "result = influence*strip + (1-influence)*below"
-            # means influence=1.0 makes the strip fully replace whatever
-            # is below it in the stack (Base) - so every frame captured
-            # above would have been 100% this Sim layer's own result and
-            # 0% Base, even though _clear_action_keyframes() had already
-            # emptied this layer's own action (so its own strip is a
-            # transparent no-op regardless of influence, and the real
-            # cause was the influence override itself, not the action
-            # content). That reproduced exactly the "Base+Sim isn't
-            # combined, only Sim/physics comes through" symptom, just from
-            # a different code path than the active-action self-reference
-            # bug fixed above. Fix: leave influence/sim_mix untouched
-            # during capture, so the read pass records whatever Base+Sim
-            # blend was actually on screen (respecting the Layer
-            # Weight/Sim Mix the user had dialed in at bake time). Only
-            # now, after every frame's true combined pose has already
-            # been captured into `captured`, do we force this layer to
-            # influence=1.0 / sim_mix=0.0 - purely so that from now on
-            # (after baking) this layer's strip fully reproduces the
-            # baked result on its own during playback, without needing
-            # Base underneath or live physics on top (which would double-
-            # apply on top of an already-finalized bake).
-            active_layer.influence = 1.0
-            active_layer.sim_mix = 0.0
+    def _layer(self, obj):
+        for l in obj.wiggle_layers:
+            if l.name == self._layer_name:
+                return l
+        return None
 
-            # Bug fix: "Due to the NLA stack setup..." - inserting a
-            # keyframe into target_action while it's simultaneously being
-            # evaluated via its own NLA strip gets rejected. The write
-            # pass no longer re-evaluates, but mute it anyway to be safe.
+    def _bake_label(self, step):
+        kind, val = step
+        if kind == 'PREROLL':
+            return f"Wiggle bake: preroll frame {val}"
+        if kind == 'CAPTURE':
+            return f"Wiggle bake: simulating frame {val} / {self._end_frame}"
+        if kind == 'BEGIN_WRITE':
+            return "Wiggle bake: preparing keyframes"
+        return (f"Wiggle bake: writing keyframes "
+                f"{self._start_frame + val} / {self._end_frame}")
+
+    def _bake_can_cancel(self, step):
+        # Once writing starts, the target action has been cleared, so
+        # stopping halfway would leave a half-written bake.
+        return step[0] in {'PREROLL', 'CAPTURE'}
+
+    def _bake_step(self, context, step):
+        kind, val = step
+        scene = context.scene
+        obj = self._obj()
+        w = scene.wiggle
+
+        if kind == 'PREROLL':
+            w.is_preroll = True
+            scene.frame_set(val)
+            context.view_layer.update()
+
+        elif kind == 'CAPTURE':
+            # The start frame must continue from the preroll (not reset),
+            # so the preroll flag stays on for exactly that one frame.
+            w.is_preroll = bool(self._has_preroll and val == self._start_frame)
+            scene.frame_set(val)
+            context.view_layer.update()
+            w.is_preroll = False
+            frame_data = {}
+            for name in self._bake_bone_names:
+                pb = obj.pose.bones.get(name)
+                if pb is None:
+                    continue
+                if pb.rotation_mode == 'QUATERNION':
+                    rot = pb.rotation_quaternion.copy()
+                elif pb.rotation_mode == 'AXIS_ANGLE':
+                    rot = pb.rotation_axis_angle[:]
+                else:
+                    rot = pb.rotation_euler.copy()
+                frame_data[pb.name] = (pb.location.copy(), pb.rotation_mode, rot, pb.scale.copy())
+            self._captured.append((val, frame_data))
+
+        elif kind == 'BEGIN_WRITE':
+            self._write_started = True
+            w.is_preroll = False
+            target_action = bpy.data.actions.get(self._action_name)
+            # Clear now, after capture (a no-op on a brand-new action).
+            _clear_action_keyframes(target_action)
+
+            # Only after capture: make this layer reproduce the bake on its
+            # own (influence 1, no live physics on top). Leaving these
+            # untouched during capture is what keeps the Base+Sim blend.
+            layer = self._layer(obj)
+            if layer:
+                layer.influence = 1.0
+                layer.sim_mix = 0.0
+
+            # The influence update re-syncs layers, so mute again here.
             target_track = _find_track_for_action(obj, target_action)
-            target_track_prev_mute = target_track.mute if target_track else None
             if target_track:
                 target_track.mute = True
 
+            # Write straight into the action; no re-evaluation happens
+            # during writing, so the active-action overlay issue can't occur.
             obj.animation_data.action = target_action
             if hasattr(obj.animation_data, "action_influence"):
                 obj.animation_data.action_influence = 1.0
             if hasattr(obj.animation_data, "action_blend_type"):
                 obj.animation_data.action_blend_type = 'REPLACE'
 
-            for f, frame_data in captured:
-                for pb in bake_bones:
-                    loc, rot_mode, rot, scale = frame_data[pb.name]
-                    pb.location = loc
-                    pb.keyframe_insert(data_path="location", frame=f, group=pb.name)
-                    if rot_mode == 'QUATERNION':
-                        pb.rotation_quaternion = rot
-                        pb.keyframe_insert(data_path="rotation_quaternion", frame=f, group=pb.name)
-                    elif rot_mode == 'AXIS_ANGLE':
-                        pb.rotation_axis_angle = rot
-                        pb.keyframe_insert(data_path="rotation_axis_angle", frame=f, group=pb.name)
-                    else:
-                        pb.rotation_euler = rot
-                        pb.keyframe_insert(data_path="rotation_euler", frame=f, group=pb.name)
-                    pb.scale = scale
-                    pb.keyframe_insert(data_path="scale", frame=f, group=pb.name)
-        finally:
-            _baking_in_progress = False
+        elif kind == 'WRITE':
+            f, frame_data = self._captured[val]
+            for name in self._bake_bone_names:
+                pb = obj.pose.bones.get(name)
+                if pb is None or name not in frame_data:
+                    continue
+                loc, rot_mode, rot, scale = frame_data[pb.name]
+                pb.location = loc
+                pb.keyframe_insert(data_path="location", frame=f, group=pb.name)
+                if rot_mode == 'QUATERNION':
+                    pb.rotation_quaternion = rot
+                    pb.keyframe_insert(data_path="rotation_quaternion", frame=f, group=pb.name)
+                elif rot_mode == 'AXIS_ANGLE':
+                    pb.rotation_axis_angle = rot
+                    pb.keyframe_insert(data_path="rotation_axis_angle", frame=f, group=pb.name)
+                else:
+                    pb.rotation_euler = rot
+                    pb.keyframe_insert(data_path="rotation_euler", frame=f, group=pb.name)
+                pb.scale = scale
+                pb.keyframe_insert(data_path="scale", frame=f, group=pb.name)
 
-        obj.animation_data.action = None
+    def _restore_track_mute(self, obj):
+        target_action = bpy.data.actions.get(self._action_name)
+        target_track = _find_track_for_action(obj, target_action) if target_action else None
         if target_track:
-            target_track.mute = target_track_prev_mute if target_track_prev_mute is not None else False
-        obj.wiggle_freeze = True
-        scene.frame_set(orig_frame)
-        sync_layers(obj)
-        self.report({'INFO'}, f"Bake Complete into '{target_action.name}': {start_frame}~{end_frame}")
+            prev = self._target_track_prev_mute
+            target_track.mute = prev if prev is not None else False
+
+    def _clear_no_cache(self):
+        try:
+            from . import wiggle_2 as _w2
+            _w2._BAKE_NO_CACHE = False
+        except Exception:
+            pass
+
+    def _bake_finish(self, context):
+        global _baking_in_progress
+        _baking_in_progress = False
+        self._clear_no_cache()
+        scene = context.scene
+        obj = self._obj()
+        scene.wiggle.is_preroll = False
+        self._captured = []
+        if obj:
+            obj.animation_data.action = None
+            self._restore_track_mute(obj)
+            obj.wiggle_freeze = True
+        scene.frame_set(self._orig_frame)
+        if obj:
+            sync_layers(obj)
+        what = (f"{len(self._bake_bone_names)} physics bones (Smart Bake)"
+                if self._smart else "all bones")
+        self.report({'INFO'}, f"Bake Complete into '{self._action_name}' ({what}): "
+                              f"{self._start_frame}~{self._end_frame}")
         return {'FINISHED'}
+
+    def _bake_abort(self, context):
+        global _baking_in_progress
+        _baking_in_progress = False
+        self._clear_no_cache()
+        scene = context.scene
+        scene.wiggle.is_preroll = False
+        self._captured = []
+        obj = self._obj()
+        if obj and obj.animation_data:
+            if self._write_started:
+                # Only reachable if writing raised an error (Esc is ignored
+                # during writing); keep what was written, but restore the
+                # normal NLA playback setup.
+                obj.animation_data.action = None
+                self._restore_track_mute(obj)
+            else:
+                ad = obj.animation_data
+                if self._created_prev_track_name:
+                    tr = ad.nla_tracks.get(self._created_prev_track_name)
+                    if tr:
+                        ad.nla_tracks.remove(tr)
+                if self._created_layer:
+                    act = bpy.data.actions.get(self._action_name)
+                    tr = _find_track_for_action(obj, act) if act else None
+                    if tr:
+                        ad.nla_tracks.remove(tr)
+                    layers = obj.wiggle_layers
+                    for i, l in enumerate(layers):
+                        if l.name == self._layer_name:
+                            layers.remove(i)
+                            break
+                    if act and act.users == 0:
+                        bpy.data.actions.remove(act)
+                else:
+                    self._restore_track_mute(obj)
+                n = len(obj.wiggle_layers)
+                if n:
+                    obj.wiggle_layer_index = min(max(self._orig_layer_index, 0), n - 1)
+        scene.frame_set(self._orig_frame)
+        if obj:
+            sync_layers(obj)
 
 
 classes = (
@@ -1079,6 +1409,15 @@ def register():
             default=1.0, min=0.0, max=1.0
         )
 
+    # Bake progress display (WindowManager props are runtime-only and are
+    # never saved into the .blend, so a crash can't leave them stuck).
+    bpy.types.WindowManager.wiggle_bake_progress = bpy.props.FloatProperty(
+        name="Bake Progress", default=0.0, min=0.0, max=1.0, subtype='FACTOR'
+    )
+    bpy.types.WindowManager.wiggle_bake_status = bpy.props.StringProperty(
+        name="Bake Status", default=""
+    )
+
     if wiggle_frame_change_handler not in bpy.app.handlers.frame_change_pre:
         bpy.app.handlers.frame_change_pre.append(wiggle_frame_change_handler)
 
@@ -1097,6 +1436,9 @@ def unregister():
             delattr(bpy.types.Object, attr)
     if hasattr(bpy.types.PoseBone, "wiggle_influence"):
         delattr(bpy.types.PoseBone, "wiggle_influence")
+    for attr in ("wiggle_bake_progress", "wiggle_bake_status"):
+        if hasattr(bpy.types.WindowManager, attr):
+            delattr(bpy.types.WindowManager, attr)
 
     for cls in reversed(classes):
         try:

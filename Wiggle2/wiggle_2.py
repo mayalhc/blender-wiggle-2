@@ -2,125 +2,7 @@ import bpy, math
 from bpy.app.handlers import persistent
 from mathutils import Vector, Matrix, Quaternion, noise
 from . import wiggle_cache
-
-# ── Cache serialization helpers ───────────────────────────────────────────────
-# mathutils.Vector / Quaternion / Matrix cannot be pickled directly.
-# These helpers convert them to plain Python tuples before saving and
-# restore them as Vector instances after loading.
-
-def _vec_to_tuple(v):
-    """
-    Convert any sequence to a flat tuple of floats.
-    Handles: Vector, flat float arrays, AND nested sequences (Matrix rows).
-    """
-    result = []
-    for x in v:
-        try:
-            result.append(float(x))
-        except (TypeError, ValueError):
-            # x is itself iterable (e.g. a Vector row inside a Matrix)
-            for y in x:
-                result.append(float(y))
-    return tuple(result)
-
-def _serialize_bone_cache(bw):
-    """
-    Flatten all Vector/Matrix fields of a WiggleBone PropertyGroup into
-    plain Python types that pickle can handle.
-
-    bw.matrix is a FloatVectorProperty(size=16, subtype='MATRIX').
-    In Blender 5.x the property getter may return a sequence of Vector
-    rows instead of a flat float array, so _vec_to_tuple flattens
-    both cases automatically.
-    """
-    # Safely read matrix: try as flat array first, fall back to per-element
-    try:
-        mat_flat = tuple(float(x) for x in bw.matrix)
-        if len(mat_flat) != 16:
-            raise ValueError("not 16 elements")
-    except (TypeError, ValueError):
-        # Nested rows path
-        mat_flat = _vec_to_tuple(bw.matrix)
-
-    return {
-        "position":             tuple(float(x) for x in bw.position),
-        "position_last":        tuple(float(x) for x in bw.position_last),
-        "velocity":             tuple(float(x) for x in bw.velocity),
-        "position_head":        tuple(float(x) for x in bw.position_head),
-        "position_last_head":   tuple(float(x) for x in bw.position_last_head),
-        "velocity_head":        tuple(float(x) for x in bw.velocity_head),
-        "collision_point":      tuple(float(x) for x in bw.collision_point),
-        "collision_normal":     tuple(float(x) for x in bw.collision_normal),
-        "collision_point_head": tuple(float(x) for x in bw.collision_point_head),
-        "collision_normal_head":tuple(float(x) for x in
-                                      getattr(bw, "collision_normal_head", (0.0, 0.0, 0.0))),
-        "matrix":               mat_flat,
-        "adaptive_damp_mod":    float(getattr(bw, "adaptive_damp_mod", 0.0)),
-    }
-
-def _deserialize_bone_cache(bw, data):
-    """Restore plain-tuple cache data back into a WiggleBone PropertyGroup.
-    [Bug fix] Every field is now read defensively (.get with fallbacks) so
-    cache files written by older versions - which stored only 7 of these
-    fields - can't raise KeyError on load."""
-    bw.position              = data.get("position", (0.0, 0.0, 0.0))
-    bw.position_last         = data.get("position_last",
-                                        data.get("position", (0.0, 0.0, 0.0)))
-    bw.velocity              = data.get("velocity", (0.0, 0.0, 0.0))
-    bw.position_head         = data.get("position_head", (0.0, 0.0, 0.0))
-    bw.position_last_head    = data.get("position_last_head",
-                                        data.get("position_head", (0.0, 0.0, 0.0)))
-    bw.velocity_head         = data.get("velocity_head", (0.0, 0.0, 0.0))
-    bw.collision_point       = data.get("collision_point", (0.0, 0.0, 0.0))
-    bw.collision_normal      = data.get("collision_normal", (0.0, 0.0, 0.0))
-    bw.collision_point_head  = data.get("collision_point_head", (0.0, 0.0, 0.0))
-    bw.collision_normal_head = data.get("collision_normal_head", (0.0, 0.0, 0.0))
-    bw.matrix                = data.get("matrix",
-                                        (1, 0, 0, 0,
-                                         0, 1, 0, 0,
-                                         0, 0, 1, 0,
-                                         0, 0, 0, 1))
-    bw.adaptive_damp_mod     = float(data.get("adaptive_damp_mod", 0.0))
-
-def _build_serializable_wo(ob, wo):
-    """
-    Build a pure-Python dict representing the wiggle state of all bones
-    in `wo`.  This is what gets pickled instead of the raw PropertyGroup.
-    """
-    bones_data = {}
-    for wb in wo.list:
-        b = ob.pose.bones.get(wb.name)
-        if b is None:
-            continue
-        bones_data[wb.name] = _serialize_bone_cache(b.wiggle)
-    return bones_data
-
-def _restore_wo_from_dict(ob, bones_data):
-    """Restore a previously serialized wo dict back into pose bone properties."""
-    for bone_name, data in bones_data.items():
-        b = ob.pose.bones.get(bone_name)
-        if b is None:
-            continue
-        _deserialize_bone_cache(b.wiggle, data)
-
-def all_frames_cached(scene, cf):
-    """True when the disk cache is enabled and every active wiggle object
-    already has `cf` on disk. Lets wiggle_post SKIP the hard reset on
-    backward jumps/frame_start so the cached pose is loaded directly -
-    previously the reset branch returned before the cache was consulted,
-    so scrubbing backwards always showed the un-wiggled rest pose.
-    Objects wiggle_post skips anyway (muted/frozen) are ignored here too."""
-    if not getattr(scene, "wiggle_cache_enable", False):
-        return False
-    if not scene.wiggle.list:
-        return False
-    for wo in scene.wiggle.list:
-        ob = scene.objects.get(wo.name)
-        if ob is None or ob.wiggle_mute or getattr(ob, "wiggle_freeze", False):
-            continue
-        if not wiggle_cache.has_frame(scene, ob.name, cf):
-            return False
-    return True
+from .wiggle_layers import ModalBakeMixin, bake_running, NoAutoKey
 
 ZERO = Vector((0, 0, 0))
 #return m2 in m1 space
@@ -162,30 +44,50 @@ def reset_bone(b):
     reset_bones_batch([b])
 
 
-def reset_bones_batch(bones):
+def reset_bones_batch(bones, do_update=True):
     bones = [b for b in bones if b is not None]
     if not bones:
         return
     clear_parent_cache()
 
     # 1. Reset every bone's visual pose back to its rest position
+    old_basis = {}
     for b in bones:
+        old_basis[b.name] = b.matrix_basis.copy()
         b.matrix_basis = Matrix.Identity(4)
         b.id_data.update_tag()
 
     # 2. Recompute world matrices exactly once for the whole batch
     #    (calling this once per bone would re-evaluate the entire depsgraph
     #    that many times, which gets very slow on rigs with many bones)
-    bpy.context.view_layer.update()
+    #
+    #    [Crash fix] NEVER call this from inside a frame_change handler:
+    #    re-entering the depsgraph during its own evaluation segfaults
+    #    Blender 4.x / 5.0.x (EXCEPTION_ACCESS_VIOLATION in
+    #    BKE_object_eval_eval_base_flags - reproduced & confirmed).
+    #    Handlers pass do_update=False and the rest pose is then derived
+    #    below instead of being re-evaluated.
+    if do_update:
+        bpy.context.view_layer.update()
 
     zero_v = Vector((0, 0, 0))
     for b in bones:
-        # 3. Grab each bone's now-updated real world position
+        # 3. The pose matrix the bone has with an identity basis.
+        #    With do_update the depsgraph just re-evaluated it; without it,
+        #    derive it from the still-current evaluated pose:
+        #    pose = A @ basis  =>  A = pose @ basis^-1
         world_mat = b.id_data.matrix_world
-        current_world_matrix = world_mat @ b.matrix
+        if do_update:
+            rest_pose = b.matrix
+        else:
+            try:
+                rest_pose = b.matrix @ old_basis[b.name].inverted()
+            except Exception:
+                rest_pose = b.bone.matrix_local
+        current_world_matrix = world_mat @ rest_pose
 
         # 4. Fully sync the physics coordinates to the bone's actual world position
-        curr_tail_pos = (world_mat @ b.matrix @ Matrix.Translation(Vector((0, b.bone.length, 0)))).translation
+        curr_tail_pos = (world_mat @ rest_pose @ Matrix.Translation(Vector((0, b.bone.length, 0)))).translation
         curr_head_pos = current_world_matrix.translation
 
         # 5. Completely zero out acceleration and velocity (prevents flying off)
@@ -233,6 +135,8 @@ def update_prop(self, context, prop):
     """Propagate the same value to selected pose bones. Dropped the b[prop] approach in favor of setattr for consistency."""
     if context.scene.get("wiggle_updating"):
         return
+    if prop != 'wiggle_enable':
+        invalidate_auto_cache(context.scene)
     val = getattr(self, prop)
     context.scene["wiggle_updating"] = True
     try:
@@ -274,20 +178,69 @@ def update_prop(self, context, prop):
 
 _GET_PARENT_CACHE = {}
 
-# Per-object transform trackers for the Adaptive Safety Guard.
-# [Bug fix] These were stored by assigning new attributes onto the
-# WiggleScene PropertyGroup (w.last_ob_pos = {}), but bpy_struct rejects
-# unknown attributes with AttributeError, crashing wiggle_post every
-# frame whenever Adaptive Damping was enabled.
-_LAST_OB_POS = {}
-_LAST_OB_ROT = {}
-
 # So the Sim Mix Layers' Layer Weight/Sim Mix sliders can refresh the preview
 # instantly without actually changing the current frame, this stores, per
 # bone, the (animation rotation, simulation rotation, rotation_mode,
 # animation position, simulation position) computed on the last real frame.
 # Key: (object name, bone name). Consumed by refresh_influence_blend().
 _LAST_BLEND_CACHE = {}
+
+# Per-object transform trackers for the Adaptive Safety Guard.
+# Stored as module-level dicts: writing custom attributes onto the
+# WiggleScene PropertyGroup does NOT persist between accesses (each
+# access returns a fresh Python wrapper), so trackers kept there would
+# reset every frame.
+_LAST_OB_POS = {}
+_LAST_OB_ROT = {}
+
+# Auto Cache state (runtime only, never saved into the .blend).
+# _AUTO_VALID[scene name] = last frame whose physics state is trustworthy,
+# i.e. simulated continuously from the start frame or loaded from cache.
+# None = the current state isn't continuous (e.g. after jumping into an
+# uncached part of the timeline), so physics pauses until you rewind to the
+# start or step on from a cached frame - same rule as Blender's cloth cache.
+# _AUTO_IDLE = objects already clean-reset while paused (reset only once).
+_AUTO_VALID = {}
+_AUTO_IDLE = set()
+
+# True while a bake with Preroll runs: the disk cache is bypassed (no load,
+# no save), because cached frames come from playback without preroll and
+# would replace the warmed-up simulation.
+_BAKE_NO_CACHE = False
+
+
+def _baseline_valid(scene, frame):
+    return frame if frame <= scene.frame_start else None
+
+
+def invalidate_auto_cache(scene):
+    """Settings changed: cached frames no longer match, so clear them
+    (Auto Cache only). Physics stays usable at the start frame; mid-timeline
+    it pauses until you rewind, so nothing mixes old and new settings."""
+    if not getattr(scene, "wiggle_auto_cache", False):
+        return
+    try:
+        wiggle_cache.clear_cache(scene)
+    except Exception as e:
+        print(f"Wiggle2: auto cache clear failed ({e})")
+    _AUTO_VALID[scene.name] = _baseline_valid(scene, scene.frame_current)
+    _AUTO_IDLE.clear()
+
+
+def auto_cache_paused(scene):
+    """True when Auto Cache is on and physics is paused at this frame."""
+    if not getattr(scene, "wiggle_auto_cache", False):
+        return False
+    cf = scene.frame_current
+    if cf <= scene.frame_start or _AUTO_VALID.get(scene.name) is not None:
+        return False
+    return not any(wiggle_cache.has_frame(scene, wo.name, cf) for wo in scene.wiggle.list)
+
+
+def _update_auto_cache_toggle(self, context):
+    scene = context.scene
+    _AUTO_VALID[scene.name] = _baseline_valid(scene, scene.frame_current)
+    _AUTO_IDLE.clear()
 
 
 def refresh_influence_blend(obj):
@@ -354,11 +307,32 @@ def collider_poll(self, object):
         return True
     return object.type == 'MESH'
 
-WIND_FIELD_TYPES = {'WIND', 'TURBULENCE', 'VORTEX'}
+WIND_FIELD_TYPES = {'WIND', 'TURBULENCE', 'VORTEX', 'FORCE'}
 
 def wind_poll(self, object):
-    # [Feature extension] Originally only the WIND type was allowed. Now Turbulence/Vortex are also supported.
+    # [Feature extension] Originally only the WIND type was allowed. Now Turbulence/Vortex/Force are also supported.
     return object.field and object.field.type in WIND_FIELD_TYPES
+
+
+def gather_wind_objects(wind_ob, wind_coll):
+    """All force-field objects affecting a bone: the single Wind object plus
+    every supported field inside the Wind Collection (child collections
+    included). Deduplicated so an object that is both the single pick and in
+    the collection isn't applied twice."""
+    result = []
+    seen = set()
+    if wind_ob and wind_ob.field and wind_ob.field.type in WIND_FIELD_TYPES:
+        result.append(wind_ob)
+        seen.add(wind_ob.name)
+    if wind_coll:
+        for ob in wind_coll.all_objects:
+            if ob.name in seen:
+                continue
+            f = ob.field
+            if f and f.type in WIND_FIELD_TYPES:
+                result.append(ob)
+                seen.add(ob.name)
+    return result
 
 
 def compute_wind_force(wind_ob, pos, ref_dir, mass, wind_mult):
@@ -402,7 +376,59 @@ def compute_wind_force(wind_ob, pos, ref_dir, mass, wind_mult):
         falloff = 1.0 / max(dist, 0.1)
         return combined_world * strength * wind_mult * falloff / mass
 
+    elif field.type == 'FORCE':
+        return compute_force_field(wind_ob, field, pos, strength, wind_mult, mass)
+
     return Vector((0, 0, 0))
+
+
+def _field_falloff(field, dist):
+    """Distance falloff matching Blender's effector falloff:
+    (1 + dist - min_dist) ^ -power, zero beyond Max Distance, full strength
+    inside Min Distance."""
+    if getattr(field, 'use_max_distance', False) and dist > field.distance_max:
+        return 0.0
+    d_min = field.distance_min if getattr(field, 'use_min_distance', False) else 0.0
+    if dist <= d_min:
+        return 1.0
+    power = getattr(field, 'falloff_power', 0.0)
+    if power <= 0.0:
+        return 1.0
+    return (1.0 + dist - d_min) ** (-power)
+
+
+def compute_force_field(ob, field, pos, strength, wind_mult, mass):
+    """Blender's Force field: pushes away from the field (positive strength)
+    or pulls toward it (negative strength), like it does for particles.
+    Shape: Plane pushes along the object's local Z; every other shape is
+    treated as Point (the object's origin).
+    Falloff type: Tube measures distance from the object's Z axis; Sphere
+    and Cone measure straight-line distance."""
+    mat = ob.matrix_world
+    origin = mat.translation
+    z_axis = (mat.to_3x3() @ Vector((0, 0, 1))).normalized()
+    to_pos = pos - origin
+
+    if getattr(field, 'shape', 'POINT') == 'PLANE':
+        signed = to_pos.dot(z_axis)
+        direction = z_axis if signed >= 0.0 else -z_axis
+        dist = abs(signed)
+    else:
+        if getattr(field, 'falloff_type', 'SPHERE') == 'TUBE':
+            radial = to_pos - z_axis * to_pos.dot(z_axis)
+            dist = radial.length
+            direction = radial
+        else:
+            dist = to_pos.length
+            direction = to_pos
+        if dist < 1e-6:
+            return Vector((0, 0, 0))
+        direction = direction / dist
+
+    fall = _field_falloff(field, dist)
+    if fall == 0.0:
+        return Vector((0, 0, 0))
+    return direction * strength * wind_mult * fall / mass
 
 
 # ============================================================
@@ -1031,10 +1057,12 @@ def move(b, dg):
         b.wiggle.velocity *= damp
         
         F = bpy.context.scene.gravity * b.wiggle_gravity
-        if b.wiggle_wind_ob and b.wiggle_wind_ob.field:
+        winds = gather_wind_objects(b.wiggle_wind_ob, getattr(b, "wiggle_wind_collection", None))
+        if winds:
             ref_dir = (b.wiggle.position - b.wiggle.matrix.translation)
             ref_dir = ref_dir.normalized() if ref_dir.length > 1e-8 else Vector((0, 0, 1))
-            F += compute_wind_force(b.wiggle_wind_ob, b.wiggle.position, ref_dir, b.wiggle_mass, b.wiggle_wind)
+            for w_ob in winds:
+                F += compute_wind_force(w_ob, b.wiggle.position, ref_dir, b.wiggle_mass, b.wiggle_wind)
 
         h_pos = b.wiggle.position_head if (b.wiggle_head and not b.bone.use_connect) else h_pos_anim
         target_pos = h_pos + rest_dir * world_rest_length
@@ -1067,11 +1095,13 @@ def move(b, dg):
         F_h = bpy.context.scene.gravity * b.wiggle_gravity_head
         # [Bug fix] wiggle_wind_ob_head/wiggle_wind_head were registered and
         # exposed in the UI, but never actually applied here (only Tail wind worked).
-        if b.wiggle_wind_ob_head and b.wiggle_wind_ob_head.field:
+        winds_h = gather_wind_objects(b.wiggle_wind_ob_head, getattr(b, "wiggle_wind_collection_head", None))
+        if winds_h:
             ref_dir_h = (b.wiggle.position_head - b.wiggle.matrix.translation)
             ref_dir_h = ref_dir_h.normalized() if ref_dir_h.length > 1e-8 else Vector((0, 0, 1))
-            F_h += compute_wind_force(b.wiggle_wind_ob_head, b.wiggle.position_head, ref_dir_h,
-                                       b.wiggle_mass_head, b.wiggle_wind_head)
+            for w_ob in winds_h:
+                F_h += compute_wind_force(w_ob, b.wiggle.position_head, ref_dir_h,
+                                           b.wiggle_mass_head, b.wiggle_wind_head)
         stiff_h_clamped = min(b.wiggle_stiff_head, 1.0 / dt2 * 0.1)
         F_h += (h_pos_anim - b.wiggle.position_head) * stiff_h_clamped
 
@@ -1285,8 +1315,83 @@ def constrain(b, i, dg, dt=None, iterations=None):
 # END OF REVISION #
 
 
+def _capture_anim_pose(bones):
+    """The animated (pre-physics) rotation/location/scale of each bone,
+    used to blend physics against animation by wiggle_influence."""
+    rots = {b.name: b.rotation_quaternion.copy() if b.rotation_mode == 'QUATERNION'
+            else b.rotation_euler.to_quaternion() for b in bones}
+    locs = {b.name: b.location.copy() for b in bones}
+    scales = {b.name: b.scale.copy() for b in bones}
+    return rots, locs, scales
+
+
+def _blend_with_animation(ob, b, anim_pose):
+    """After update_matrix(b, True) has written the simulated pose: cache
+    it for Sim Mix slider previews, and blend it toward the animated pose
+    when wiggle_influence < 1. Writes whichever channel matches the bone's
+    rotation_mode (Euler rigs ignore rotation_quaternion), and blends
+    location/scale too so floating heads and Stretch return to the
+    animation at influence 0. update_matrix() must not run again after
+    this, or it would overwrite the blended channels."""
+    orig_rots, orig_locs, orig_scales = anim_pose
+    inf = getattr(b, "wiggle_influence", 1.0)
+    sim_q = b.matrix_basis.to_quaternion()
+    anim_q = orig_rots.get(b.name, Quaternion((1, 0, 0, 0)))
+    sim_loc = b.location.copy()
+    anim_loc = orig_locs.get(b.name, sim_loc)
+    sim_scale = b.scale.copy()
+    anim_scale = orig_scales.get(b.name, sim_scale)
+
+    _LAST_BLEND_CACHE[(ob.name, b.name)] = (
+        anim_q.copy(), sim_q.copy(), b.rotation_mode,
+        anim_loc.copy(), sim_loc.copy(),
+        anim_scale.copy(), sim_scale.copy(),
+    )
+
+    if inf < 1.0:
+        blended_q = anim_q.slerp(sim_q, inf)
+        if b.rotation_mode == 'QUATERNION':
+            b.rotation_quaternion = blended_q
+        elif b.rotation_mode == 'AXIS_ANGLE':
+            axis, angle = blended_q.to_axis_angle()
+            b.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
+        else:
+            b.rotation_euler = blended_q.to_euler(b.rotation_mode)
+        b.location = anim_loc.lerp(sim_loc, inf)
+        b.scale = anim_scale.lerp(sim_scale, inf)
+
+
+def _apply_cached_frame(scene, ob, wo):
+    """Load this frame's cached physics state for `ob` and pose its bones
+    from it (same final steps as a live simulated frame). Returns False
+    if the frame isn't cached."""
+    bones = [ob.pose.bones.get(wb.name) for wb in wo.list]
+    bones = [b for b in bones if b is not None and not b.wiggle_mute]
+    anim_pose = _capture_anim_pose(bones)
+    try:
+        if not wiggle_cache.load_frame(scene, ob, wo):
+            return False
+        for b in bones:
+            update_matrix(b, True)
+            _blend_with_animation(ob, b, anim_pose)
+    except Exception as e:
+        # Never let a cache problem stop the physics: report it and let
+        # the caller simulate this frame normally instead.
+        print(f"Wiggle2 cache: failed to apply frame {scene.frame_current} "
+              f"for '{ob.name}' ({type(e).__name__}: {e})")
+        return False
+    ob.update_tag()
+    return True
+
+
 @persistent
 def wiggle_post(scene, dg):
+    # Auto Keying off while physics writes bone transforms (see NoAutoKey).
+    with NoAutoKey(scene):
+        _wiggle_post_impl(scene, dg)
+
+
+def _wiggle_post_impl(scene, dg):
     w = scene.wiggle
     cf = scene.frame_current
     
@@ -1316,23 +1421,54 @@ def wiggle_post(scene, dg):
     loop_enabled = getattr(scene, "wiggle_use_loop", False)
     is_playing = bool(bpy.context.screen and bpy.context.screen.is_animation_playing)
     is_natural_loop = loop_enabled and is_playing and cf <= scene.frame_start and lastframe >= scene.frame_end
-
-    # [Disk cache] Read once here so both the reset gate below and the
-    # per-object load in the main loop share the same value.
-    cache_enabled = getattr(scene, "wiggle_cache_enable", False)
+    # With Auto Cache the frames after the start come from the cache (the
+    # first pass), so carrying end-of-loop motion into the start frame would
+    # only cause a one-frame mismatch. Use the normal clean start instead.
+    if getattr(scene, "wiggle_auto_cache", False):
+        is_natural_loop = False
 
     # 2. [Reset logic] - precisely target only the bones in the wiggle list, instead of iterating every bone
-    #    [Bug fix] When a complete disk cache exists for this frame, fall
-    #    through to the main loop (which loads the cached pose) instead of
-    #    hard-resetting and returning - the old gate returned before the
-    #    cache was ever consulted, so scrubbing/jumping backwards always
-    #    showed the un-wiggled rest pose even with the cache enabled.
-    if (not is_natural_loop
-            and ((cf <= scene.frame_start) or (cf < lastframe))
-            and not all_frames_cached(scene, cf)):
+    # Preroll (during a bake): frames before the start frame must build the
+    # simulation up instead of resetting it on every frame, and the start
+    # frame must continue from them. So in preroll mode only a jump (any
+    # frame that isn't exactly the next one) resets - that's the first
+    # preroll frame. The is_preroll flag used to be set by the bake but was
+    # never read here, so preroll silently did nothing.
+    if getattr(w, "is_preroll", False):
+        needs_reset = (cf != lastframe + 1)
+    else:
+        needs_reset = (cf <= scene.frame_start) or (cf < lastframe)
+    if not is_natural_loop and needs_reset:
+        auto = getattr(scene, "wiggle_auto_cache", False) and not _BAKE_NO_CACHE
+        cache_on = (getattr(scene, "wiggle_cache_enable", False) or auto) and not _BAKE_NO_CACHE
+        all_loaded = True
         for wo in w.list:
             ob = scene.objects.get(wo.name)
             if not ob: continue
+            active_ob = not ob.wiggle_mute and not getattr(ob, "wiggle_freeze", False)
+            # Disk cache: jumping back to a frame that's already cached
+            # loads it instead of resetting (the point of a scrub cache).
+            if (cache_on and active_ob and wiggle_cache.has_frame(scene, ob.name, cf)):
+                clear_parent_cache()
+                if _apply_cached_frame(scene, ob, wo):
+                    _AUTO_IDLE.discard(ob.name)
+                    continue
+            if active_ob:
+                all_loaded = False
+                if auto and cf > scene.frame_start:
+                    _AUTO_IDLE.add(ob.name)  # reset below = paused pose
+            # Auto clean reset: the quick reset below zeroes the channels
+            # but then reads b.matrix before Blender re-evaluates it, so it
+            # picks up the pose from the frame you jumped FROM, and it never
+            # resets head position/velocity. reset_bones_batch() is what
+            # Hard Reset uses: rest pose -> re-evaluate -> sync everything.
+            if getattr(scene, "wiggle_auto_reset", True) and not getattr(ob, "wiggle_freeze", False):
+                try:
+                    reset_bones_batch([ob.pose.bones.get(wb.name) for wb in wo.list], do_update=False)
+                    ob.update_tag()
+                    continue
+                except Exception as e:
+                    print(f"Wiggle2: auto reset failed for '{ob.name}' ({e}), using quick reset")
             if ob.animation_data: ob.update_tag()
             
             for wb in wo.list:
@@ -1355,6 +1491,13 @@ def wiggle_post(scene, dg):
             for wb in wo.list:
                 b = ob.pose.bones.get(wb.name)
                 if b: update_matrix(b, True)
+
+        if auto:
+            if cf <= scene.frame_start:
+                _AUTO_VALID[scene.name] = cf   # clean start: cache from here
+                _AUTO_IDLE.clear()
+            else:
+                _AUTO_VALID[scene.name] = cf if all_loaded else None
                 
         w.lastframe = cf
         w.reset = False
@@ -1364,6 +1507,20 @@ def wiggle_post(scene, dg):
     w.dt = (1.0 / max(1.0, scene.render.fps))
     w.lastframe = cf
 
+    # Auto Cache: only trust (and cache) this frame if the physics state
+    # it continues from is itself trustworthy.
+    auto = getattr(scene, "wiggle_auto_cache", False) and not _BAKE_NO_CACHE
+    continuous = True
+    frame_valid = True
+    if auto:
+        prev_valid = _AUTO_VALID.get(scene.name)
+        if prev_valid is None and lastframe <= scene.frame_start:
+            prev_valid = lastframe  # e.g. right after opening the file at the start
+        # During playback a dropped frame still counts as continuous;
+        # when scrubbing, jumping over frames does not.
+        continuous = prev_valid is not None and (
+            cf == prev_valid + 1 or (is_playing and cf > prev_valid))
+
     # 4. Main loop
     for wo in w.list:
         ob = scene.objects.get(wo.name)
@@ -1372,29 +1529,30 @@ def wiggle_post(scene, dg):
         # keyframes and overwriting the result.
         if not ob or ob.wiggle_mute or getattr(ob, "wiggle_freeze", False): continue
 
-        # [Feature added] Disk point cache - load precomputed frames instead
-        # of re-simulating.
-        # [Bug fix] load_frame() is now a PURE READER returning the plain
-        # dict (or None on miss/corruption). The old version both wrote into
-        # PropertyGroups itself AND returned a bool, which meant the
-        # dict-based restore path below was dead code and only part of the
-        # state (7 of 12 fields - collision/sticky state lost) was ever
-        # restored.
-        if cache_enabled:
-            _cached = wiggle_cache.load_frame(scene, ob.name, cf)
-            if _cached is not None:
-                _restore_wo_from_dict(ob, _cached)
-                # Drop stale blend-cache entries so moving the Sim Mix slider
-                # afterwards can't re-apply rotations/locations belonging to a
-                # different frame on top of the freshly loaded pose.
-                for _key in [k for k in _LAST_BLEND_CACHE if k[0] == ob.name]:
-                    _LAST_BLEND_CACHE.pop(_key, None)
-                for wb in wo.list:
-                    b = ob.pose.bones.get(wb.name)
-                    if b:
-                        update_matrix(b, True)
-                ob.update_tag()
+        # [Feature added] Disk point cache - if a frame has already been
+        # computed, load and apply it directly instead of re-simulating
+        # (avoids re-simulating from frame_start every time when scrubbing
+        # the timeline).
+        cache_enabled = (getattr(scene, "wiggle_cache_enable", False) or auto) and not _BAKE_NO_CACHE
+        if cache_enabled and wiggle_cache.has_frame(scene, ob.name, cf):
+            if _apply_cached_frame(scene, ob, wo):
+                _AUTO_IDLE.discard(ob.name)
                 continue
+
+        # Auto Cache: uncached frame that doesn't continue from a trusted
+        # one -> don't start a fresh (wrong) simulation mid-timeline.
+        # Clean-reset once so bones just follow the animation, then idle.
+        if auto and not continuous:
+            frame_valid = False
+            if ob.name not in _AUTO_IDLE:
+                try:
+                    reset_bones_batch([ob.pose.bones.get(wb.name) for wb in wo.list], do_update=False)
+                except Exception as e:
+                    print(f"Wiggle2: auto cache pause reset failed for '{ob.name}' ({e})")
+                _AUTO_IDLE.add(ob.name)
+                ob.update_tag()
+            continue
+        _AUTO_IDLE.discard(ob.name)
 
         # Safety Boost (kept as a separate per-object calculation)
         safety_boost = 0.0
@@ -1402,9 +1560,6 @@ def wiggle_post(scene, dg):
             sensitivity = getattr(scene, "wiggle_safety_threshold", 10.0)
 
             # 1. Detect movement speed (original)
-            # [Bug fix] These trackers now live in module-level dicts -
-            # assigning new attributes onto the WiggleScene PropertyGroup
-            # raised AttributeError and killed the handler every frame.
             current_pos = ob.matrix_world.translation.copy()
             last_pos = _LAST_OB_POS.get(ob.name, current_pos)
             delta_move = current_pos - last_pos
@@ -1433,18 +1588,9 @@ def wiggle_post(scene, dg):
         active_bones = [b for b in active_bones if b is not None]
         if not active_bones: continue
 
-        orig_rots = {b.name: b.rotation_quaternion.copy() if b.rotation_mode == 'QUATERNION'
-                     else b.rotation_euler.to_quaternion() for b in active_bones}
-        # [Bug fix] The wiggle_influence blend only reverted rotation and
-        # never reverted position, so a floating head bone (use_connect
-        # off) would stay at wherever physics had moved it even with
-        # influence dropped to 0, sticking out like a coil. Now the
-        # original animated position is cached too.
-        orig_locs = {b.name: b.location.copy() for b in active_bones}
-        # Scale caused by Stretch needs to be reverted the same way as
-        # rotation/position (otherwise a stretched/squashed shape would
-        # remain even at influence=0).
-        orig_scales = {b.name: b.scale.copy() for b in active_bones}
+        # Animated pose before physics (also reverts position and Stretch
+        # scale at influence 0, not just rotation).
+        anim_pose = _capture_anim_pose(active_bones)
 
         for b in active_bones:
             if hasattr(b.wiggle, "adaptive_damp_mod"):
@@ -1472,61 +1618,8 @@ def wiggle_post(scene, dg):
 
         for b in active_bones:
             update_matrix(b, True)
-            inf = getattr(b, "wiggle_influence", 1.0)
-
-            # [Bug fix] The Sim Mix Layers' Layer Weight/Sim Mix never showed
-            # up in the final pose at all. (1) It only wrote to
-            # b.rotation_quaternion, but if rotation_mode isn't QUATERNION
-            # (most game/UE5-style rigs use Euler), Blender doesn't evaluate
-            # that channel at all, so it was silently ignored. (2) The
-            # subsequent call to update_matrix(b, True) never read
-            # rotation_quaternion and recomputed the matrix purely from
-            # b.wiggle.position, immediately overwriting the value that was
-            # just blended (even when in QUATERNION mode, it had no
-            # effect). Fixed by reading the actual simulated rotation from
-            # matrix_basis, blending it, and writing to whichever channel
-            # matches the bone's actual rotation_mode - this solves both
-            # problems. update_matrix() is not called again after this
-            # (doing so would ignore the channel just written and overwrite
-            # it with the physics state again).
-            sim_q = b.matrix_basis.to_quaternion()
-            anim_q = orig_rots.get(b.name, Quaternion((1, 0, 0, 0)))
-
-            # [Bug fix] Only rotation was blended while position was left
-            # alone. For a bone with a floating wiggle_head (use_connect
-            # off), update_matrix() writes b.location directly from the
-            # physics position, so even reverting only rotation toward
-            # animation left the position sitting at the physics result -
-            # the bone would still stick out like a coil even at
-            # influence=0. Position is now reverted toward the original
-            # animation the same way.
-            sim_loc = b.location.copy()
-            anim_loc = orig_locs.get(b.name, sim_loc)
-            sim_scale = b.scale.copy()
-            anim_scale = orig_scales.get(b.name, sim_scale)
-
-            # So the Sim Mix Layers can immediately re-blend with a new
-            # influence value without changing the current frame (i.e. just
-            # by moving the slider), always cache this frame's pure
-            # animation/simulation rotation, position, and scale regardless
-            # of the current inf value.
-            _LAST_BLEND_CACHE[(ob.name, b.name)] = (
-                anim_q.copy(), sim_q.copy(), b.rotation_mode,
-                anim_loc.copy(), sim_loc.copy(),
-                anim_scale.copy(), sim_scale.copy(),
-            )
-
-            if inf < 1.0:
-                blended_q = anim_q.slerp(sim_q, inf)
-                if b.rotation_mode == 'QUATERNION':
-                    b.rotation_quaternion = blended_q
-                elif b.rotation_mode == 'AXIS_ANGLE':
-                    axis, angle = blended_q.to_axis_angle()
-                    b.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
-                else:
-                    b.rotation_euler = blended_q.to_euler(b.rotation_mode)
-                b.location = anim_loc.lerp(sim_loc, inf)
-                b.scale = anim_scale.lerp(sim_scale, inf)
+            # Sim Mix Layers blend (see _blend_with_animation for details).
+            _blend_with_animation(ob, b, anim_pose)
 
         # 5. Update velocity (keeps the original values: not divided by fe)
         for b in active_bones:
@@ -1535,11 +1628,15 @@ def wiggle_post(scene, dg):
             bw.position_last = bw.position.copy()
 
         if cache_enabled:
-            # Serialize Vector/Matrix fields to plain tuples before pickling
-            _serializable = _build_serializable_wo(ob, wo)
-            wiggle_cache.save_frame(scene, ob, _serializable, cf)
+            try:
+                wiggle_cache.save_frame(scene, ob, wo, cf)
+            except Exception as e:
+                print(f"Wiggle2 cache: save failed ({e})")
 
         ob.update_tag()
+
+    if auto:
+        _AUTO_VALID[scene.name] = cf if frame_valid else None
 
 
 
@@ -1573,6 +1670,10 @@ def wiggle_load(dummy):
         # every load so an already-broken file heals itself the moment
         # it's reopened, regardless of what left it stuck.
         scene.wiggle.reset = False
+    _AUTO_VALID.clear()
+    _AUTO_IDLE.clear()
+    _LAST_OB_POS.clear()
+    _LAST_OB_ROT.clear()
 
 # END OF REVISION #
 
@@ -1597,14 +1698,43 @@ class WiggleCopy(bpy.types.Operator):
         props = [p.identifier for p in b.bl_rna.properties
                   if p.identifier.startswith('wiggle_') and not p.is_readonly]
 
-        for sb in selected_bones:
-            if sb == b:
-                continue
-            for prop in props:
-                try:
-                    setattr(sb, prop, getattr(b, prop))
-                except (AttributeError, TypeError):
-                    pass
+        targets = [sb for sb in selected_bones if sb.name != b.name]
+        if not targets:
+            return {'FINISHED'}
+
+        # Freeze fix: every setattr below fires that property's update
+        # callback (update_prop). Without this guard, each callback
+        # re-broadcasts the value to ALL selected bones, and for
+        # head/tail/enable/mute also runs reset_bone (a full
+        # view_layer.update()) per bone plus build_list() over the whole
+        # scene. That's roughly bones x props x bones work plus hundreds
+        # of depsgraph evaluations, which locks Blender up. Setting the
+        # guard makes update_prop return immediately; we then do the
+        # expensive reset/rebuild exactly once at the end.
+        scene = context.scene
+        was_updating = scene.get("wiggle_updating", False)
+        scene["wiggle_updating"] = True
+        try:
+            for sb in targets:
+                for prop in props:
+                    try:
+                        setattr(sb, prop, getattr(b, prop))
+                    except (AttributeError, TypeError):
+                        pass
+        finally:
+            scene["wiggle_updating"] = was_updating
+
+        invalidate_auto_cache(scene)
+
+        # One rebuild + one batched reset instead of one per property per bone.
+        try:
+            build_list()
+        except Exception as e:
+            print(f"Wiggle2: build_list after copy failed ({e})")
+        try:
+            reset_bones_batch(targets)
+        except Exception as e:
+            print(f"Wiggle2: reset after copy failed ({e})")
 
         return {'FINISHED'}
 
@@ -1653,6 +1783,8 @@ class WiggleReset(bpy.types.Operator):
 
             # Pin the last-computed frame to the current one so the handler doesn't re-track it.
             context.scene.wiggle.lastframe = context.scene.frame_current
+            _AUTO_VALID[context.scene.name] = _baseline_valid(context.scene, context.scene.frame_current)
+            _AUTO_IDLE.clear()
         finally:
             context.scene.wiggle.reset = False
 
@@ -1802,18 +1934,23 @@ class WiggleBake(bpy.types.Operator):
         _wl._baking_in_progress = True
         captured = []  # list of (frame, {bone_name: (loc, rot_mode, rot, scale)})
         try:
-            # 2. Preroll stabilization
-            scene.wiggle.is_preroll = True
-            preroll_start = start_frame - max(1, wiggle_props.preroll)
-            for f in range(preroll_start, start_frame):
-                scene.frame_set(f)
-                context.view_layer.update()
-            scene.wiggle.is_preroll = False
+            # 2. Preroll stabilization (flag stays on through the start
+            # frame so it continues from the preroll instead of resetting)
+            global _BAKE_NO_CACHE
+            use_preroll = getattr(wiggle_props, "preroll", 0) > 0
+            _BAKE_NO_CACHE = use_preroll
+            if use_preroll:
+                scene.wiggle.is_preroll = True
+                preroll_start = start_frame - max(1, wiggle_props.preroll)
+                for f in range(preroll_start, start_frame):
+                    scene.frame_set(f)
+                    context.view_layer.update()
 
             # 3. Main capture loop (the active action is not touched yet)
             for f in range(start_frame, end_frame + 1):
                 scene.frame_set(f)
                 context.view_layer.update()
+                scene.wiggle.is_preroll = False
                 frame_data = {}
                 for pbone in bake_bones:
                     if pbone.rotation_mode == 'QUATERNION':
@@ -1855,6 +1992,8 @@ class WiggleBake(bpy.types.Operator):
                     pbone.keyframe_insert(data_path="scale", frame=f, group=pbone.name)
         finally:
             _wl._baking_in_progress = False
+            _BAKE_NO_CACHE = False
+            scene.wiggle.is_preroll = False
             if target_track:
                 target_track.mute = target_track_prev_mute if target_track_prev_mute is not None else False
 
@@ -1895,46 +2034,60 @@ class WiggleBake(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class WiggleBakeCache(bpy.types.Operator):
+class WiggleBakeCache(ModalBakeMixin, bpy.types.Operator):
     """Simulate the full scene frame range once and save every frame to disk,
-    so later scrubbing can load instead of re-simulating from frame_start"""
+    so later scrubbing can load instead of re-simulating from frame_start.
+    Shows progress; press Esc to cancel (frames cached so far are kept)"""
     bl_idname = "wiggle.bake_cache"
     bl_label = "Bake to Disk Cache"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        return context.scene.wiggle_enable
+        return context.scene.wiggle_enable and not bake_running()
 
-    def execute(self, context):
+    def _bake_prepare(self, context):
         scene = context.scene
-        start, end = scene.frame_start, scene.frame_end
-        if end <= start:
-            self.report({'WARNING'}, "Empty frame range (start >= end).")
-            return {'CANCELLED'}
-        original_frame = scene.frame_current
-
+        self._start, self._end = scene.frame_start, scene.frame_end
+        self._original_frame = scene.frame_current
+        self._was_enabled = getattr(scene, "wiggle_cache_enable", False)
         wiggle_cache.clear_cache(scene)
         scene.wiggle_cache_enable = True
-        try:
-            # [Bug fix] If the timeline was already parked on frame_start,
-            # frame_set(start) was a no-op and frame_change_post never fired
-            # for it. Hop to the opposite end first to guarantee a real
-            # frame change before walking the range.
-            scene.frame_set(end if original_frame == start else start)
-            for f in range(start, end + 1):
-                scene.frame_set(f)
-        finally:
-            # [Bug fix] Used to restore the previous toggle (usually False),
-            # throwing the bake away - the .wcache files existed but
-            # wiggle_post never looked at them. Leave it ON; that is the
-            # whole point of this operator.
-            scene.wiggle_cache_enable = True
-            scene.frame_set(original_frame)
+        self._steps = list(range(self._start, self._end + 1))
+        return True
 
-        self.report({'INFO'},
-                    f"Cached frames {start}-{end} -> {wiggle_cache.get_cache_dir(scene)}")
+    def _bake_label(self, step):
+        return f"Wiggle cache: frame {step} / {self._end}"
+
+    def _bake_can_cancel(self, step):
+        return True
+
+    def _bake_step(self, context, frame):
+        context.scene.frame_set(frame)
+
+    def _restore(self, context):
+        scene = context.scene
+        scene.wiggle_cache_enable = self._was_enabled
+        scene.frame_set(self._original_frame)
+
+    def _bake_finish(self, context):
+        self._restore(context)
+        scene = context.scene
+        counts = [wiggle_cache.cached_frame_count(scene, wo.name) for wo in scene.wiggle.list]
+        n = max(counts) if counts else 0
+        folder = wiggle_cache.get_cache_dir(scene)
+        if n == 0:
+            self.report({'ERROR'}, f"No frames were cached. Check that this folder is "
+                                   f"writable and the armature isn't frozen/muted: {folder}")
+            return {'CANCELLED'}
+        # A completed disk-cache bake is meant to be used: leave playback
+        # caching on so scrubbing loads from the cache immediately.
+        scene.wiggle_cache_enable = True
+        self.report({'INFO'}, f"Cached {n} frames ({self._start}-{self._end}) to {folder}")
         return {'FINISHED'}
+
+    def _bake_abort(self, context):
+        self._restore(context)
 
 
 class WiggleClearCache(bpy.types.Operator):
@@ -2147,6 +2300,12 @@ class WiggleScene(bpy.types.PropertyGroup):
     is_preroll: bpy.props.BoolProperty(default=False)
     bake_overwrite: bpy.props.BoolProperty(name='Overwrite Current Action', description='Bake wiggle into current action, instead of creating a new one', default = False)
     bake_nla: bpy.props.BoolProperty(name='Current Action to NLA', description='Move existing animation on the armature into an NLA strip', default = False) 
+    bake_smart: bpy.props.BoolProperty(
+        name='Smart Bake',
+        description='Only key the active physics bones (Tail/Head enabled, not muted). '
+                    'Every other bone keeps playing its original animation from the Base '
+                    'layer, untouched. Keep the Base layer enabled when using this',
+        default=False)
     is_rendering: bpy.props.BoolProperty(default=False)
     reset: bpy.props.BoolProperty(default=False)
 
@@ -2245,11 +2404,17 @@ def register():
         update=lambda s, c: update_prop(s, c, 'wiggle_gravity')
     )
     bpy.types.PoseBone.wiggle_wind_ob = bpy.props.PointerProperty(
-        name='Wind', type=bpy.types.Object, poll = wind_poll, override={'LIBRARY_OVERRIDABLE'}, 
+        name='Field', type=bpy.types.Object, poll = wind_poll, override={'LIBRARY_OVERRIDABLE'}, 
+        description="Wind, Turbulence, Vortex or Force field affecting the tail",
         update=lambda s, c: update_prop(s, c, 'wiggle_wind_ob')
     )
+    bpy.types.PoseBone.wiggle_wind_collection = bpy.props.PointerProperty(
+        name='Field Collection', type=bpy.types.Collection, override={'LIBRARY_OVERRIDABLE'},
+        description="Every Wind/Turbulence/Vortex/Force field in this collection affects the bone",
+        update=lambda s, c: update_prop(s, c, 'wiggle_wind_collection')
+    )
     bpy.types.PoseBone.wiggle_wind = bpy.props.FloatProperty(
-        name = 'Wind Multiplier', default = 1, override={'LIBRARY_OVERRIDABLE'},
+        name = 'Field Multiplier', default = 1, override={'LIBRARY_OVERRIDABLE'},
         update=lambda s, c: update_prop(s, c, 'wiggle_wind')
     )
     bpy.types.PoseBone.wiggle_chain = bpy.props.BoolProperty(
@@ -2277,8 +2442,14 @@ def register():
         update=lambda s, c: update_prop(s, c, 'wiggle_gravity_head')
     )
     bpy.types.PoseBone.wiggle_wind_ob_head = bpy.props.PointerProperty(
-        name='Wind', type=bpy.types.Object, poll = wind_poll, override={'LIBRARY_OVERRIDABLE'}, 
+        name='Field', type=bpy.types.Object, poll = wind_poll, override={'LIBRARY_OVERRIDABLE'}, 
+        description="Wind, Turbulence, Vortex or Force field affecting the head",
         update=lambda s, c: update_prop(s, c, 'wiggle_wind_ob_head')
+    )
+    bpy.types.PoseBone.wiggle_wind_collection_head = bpy.props.PointerProperty(
+        name='Field Collection', type=bpy.types.Collection, override={'LIBRARY_OVERRIDABLE'},
+        description="Every Wind/Turbulence/Vortex/Force field in this collection affects the head",
+        update=lambda s, c: update_prop(s, c, 'wiggle_wind_collection_head')
     )
     bpy.types.PoseBone.wiggle_wind_head = bpy.props.FloatProperty(
         name = 'Wind', default = 1, override={'LIBRARY_OVERRIDABLE'},
@@ -2389,6 +2560,24 @@ def register():
             description="Load cached frames instead of re-simulating when available",
             default=False
         )
+    if not hasattr(bpy.types.Scene, "wiggle_auto_reset"):
+        bpy.types.Scene.wiggle_auto_reset = bpy.props.BoolProperty(
+            name="Auto Clean Reset on Rewind",
+            description="When jumping back to the start frame (or scrubbing backward to "
+                        "an uncached frame), run the same clean reset as Hard Reset so no "
+                        "physics from the previous frame carries over",
+            default=True
+        )
+    if not hasattr(bpy.types.Scene, "wiggle_auto_cache"):
+        bpy.types.Scene.wiggle_auto_cache = bpy.props.BoolProperty(
+            name="Auto Cache",
+            description="Cache every frame as you play from the start (like Blender's cloth "
+                        "cache). Cached frames play back instantly; jumping into an uncached "
+                        "part of the timeline pauses physics until you rewind. Changing bone "
+                        "settings clears the cache",
+            default=False,
+            update=_update_auto_cache_toggle
+        )
     if not hasattr(bpy.types.Scene, "wiggle_cache_dir"):
         bpy.types.Scene.wiggle_cache_dir = bpy.props.StringProperty(
             name="Cache Directory", subtype='DIR_PATH', default="//wiggle2_cache/"
@@ -2419,7 +2608,7 @@ def unregister():
     # leaves an "already registered as a subclass" error. So the
     # properties (especially PointerProperty) must be cleared before the
     # classes are unregistered.
-    for attr in ("wiggle_cache_enable", "wiggle_cache_dir", "wiggle_enable", "wiggle"):
+    for attr in ("wiggle_cache_enable", "wiggle_cache_dir", "wiggle_auto_reset", "wiggle_auto_cache", "wiggle_enable", "wiggle"):
         if hasattr(bpy.types.Scene, attr):
             try: delattr(bpy.types.Scene, attr)
             except Exception: pass
@@ -2437,6 +2626,7 @@ def unregister():
         "wiggle_wind", "wiggle_chain", "wiggle_mass_head", "wiggle_stiff_head",
         "wiggle_stretch_head", "wiggle_damp_head", "wiggle_gravity_head",
         "wiggle_wind_ob_head", "wiggle_wind_head", "wiggle_chain_head",
+        "wiggle_wind_collection", "wiggle_wind_collection_head",
         "wiggle_collider_type", "wiggle_collider", "wiggle_collider_collection",
         "wiggle_radius", "wiggle_friction", "wiggle_bounce", "wiggle_sticky",
         "wiggle_collider_type_head", "wiggle_collider_head",
