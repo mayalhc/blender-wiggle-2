@@ -2077,8 +2077,16 @@ class WiggleBakeCache(ModalBakeMixin, bpy.types.Operator):
         n = max(counts) if counts else 0
         folder = wiggle_cache.get_cache_dir(scene)
         if n == 0:
-            self.report({'ERROR'}, f"No frames were cached. Check that this folder is "
-                                   f"writable and the armature isn't frozen/muted: {folder}")
+            blocked = [wo.name for wo in scene.wiggle.list
+                       if (ob := scene.objects.get(wo.name)) is not None
+                       and (getattr(ob, "wiggle_freeze", False) or ob.wiggle_mute)]
+            if blocked:
+                self.report({'ERROR'}, f"No frames were cached: {', '.join(blocked)} is frozen or muted "
+                                       f"(Bake Result C freezes the armature). Turn off Freeze/Mute "
+                                       f"on it and bake the cache again.")
+            else:
+                self.report({'ERROR'}, f"No frames were cached. Check that this folder is "
+                                       f"writable: {folder}")
             return {'CANCELLED'}
         # A completed disk-cache bake is meant to be used: leave playback
         # caching on so scrubbing loads from the cache immediately.
