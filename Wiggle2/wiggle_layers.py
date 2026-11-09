@@ -143,21 +143,33 @@ def set_strip_influence(strip, value):
     fc.update()
 
 
-def _clear_action_keyframes(action):
-    """Bug fix: starting with Blender 5.x, Actions became "layered
-    actions" (Action Slots) and action.fcurves no longer exists (fcurves
-    now live under action.layers[i].strips[j].channelbags[k].fcurves).
-    Using the old action.fcurves API unconditionally crashes baking with
-    an AttributeError. Support both by using whichever exists."""
+def _clear_action_keyframes(action, bone_names=None):
+    """Clears keyframe F-curves. If bone_names is provided, only clears
+    F-curves belonging to those specific bones, leaving other bones intact."""
+    if bone_names is None:
+        if hasattr(action, "fcurves"):
+            for fc in list(action.fcurves):
+                action.fcurves.remove(fc)
+            return
+        for layer in getattr(action, "layers", []):
+            for strip in layer.strips:
+                for cb in getattr(strip, "channelbags", []):
+                    for fc in list(cb.fcurves):
+                        cb.fcurves.remove(fc)
+        return
+
+    bone_set = set(bone_names)
     if hasattr(action, "fcurves"):
         for fc in list(action.fcurves):
-            action.fcurves.remove(fc)
+            if any(f'["{b}"]' in fc.data_path for b in bone_set):
+                action.fcurves.remove(fc)
         return
     for layer in getattr(action, "layers", []):
         for strip in layer.strips:
             for cb in getattr(strip, "channelbags", []):
                 for fc in list(cb.fcurves):
-                    cb.fcurves.remove(fc)
+                    if any(f'["{b}"]' in fc.data_path for b in bone_set):
+                        cb.fcurves.remove(fc)
 
 
 def _sync_strip_range(track, action):
@@ -1062,33 +1074,22 @@ class ModalBakeMixin:
 
 class WIGGLE_OT_BakeCombined(ModalBakeMixin, bpy.types.Operator):
     """Bakes the live blended result of the active Sim layer into the
-    action already linked to that layer. Honors the Bake panel's
-    Preroll/Overwrite/NLA settings. Shows progress; press Esc to cancel"""
+    action already linked to that layer, or directly overwrites the active action.
+    Honors Preroll/Overwrite/NLA settings. Shows progress; press Esc to cancel"""
     bl_idname   = "wiggle.bake_combined"
     bl_label    = "Bake Combined"
     bl_options  = {'REGISTER', 'UNDO'}
 
-    # ---------------------------------------------------------------
-    # Setup. Same behavior as the old single-pass execute(), with one
-    # change so Esc can cancel without losing data: an overwritten Sim
-    # layer's existing keys are no longer cleared before capture.
-    # Instead its NLA track is muted during capture (a muted track and an
-    # empty strip contribute exactly the same nothing to the evaluated
-    # pose), and the keys are only cleared right before writing.
-    # ---------------------------------------------------------------
     def _bake_prepare(self, context):
         obj   = context.object
         scene = context.scene
         if not obj or obj.type != 'ARMATURE':
             return False
 
-        # Default: bake every bone, so the result is a self-contained action
-        # even with Base muted. Smart Bake: key only the active physics
-        # bones. The Sim layer's strip is REPLACE, and a REPLACE strip only
-        # overrides channels it has keys for, so every other bone falls
-        # through to Base untouched (non-destructive).
         w_pre = scene.wiggle
         self._smart = bool(getattr(w_pre, "bake_smart", False))
+        self._direct_overwrite = bool(getattr(w_pre, "bake_overwrite", False))
+        
         if self._smart:
             names = [pb.name for pb in obj.pose.bones
                      if (getattr(pb, "wiggle_tail", False)
@@ -1121,58 +1122,57 @@ class WIGGLE_OT_BakeCombined(ModalBakeMixin, bpy.types.Operator):
         idx = self._orig_layer_index
         selected_layer = layers[idx] if 0 <= idx < len(layers) else None
 
-        # For cancel: remember what setup created so it can be removed.
         self._created_layer = False
         self._created_prev_track_name = None
 
-        active_layer = None
-        if getattr(w, "bake_overwrite", False) and selected_layer and selected_layer.type == 'SIM':
-            active_layer = selected_layer
-            target_action = bpy.data.actions.get(active_layer.action_name) if active_layer.action_name else None
+        if self._direct_overwrite:
+            target_action = obj.animation_data.action
             if not target_action:
+                target_action = bpy.data.actions.new(name="WiggleAction")
+            self._target_action = target_action
+        else:
+            active_layer = None
+            if selected_layer and selected_layer.type == 'SIM':
+                active_layer = selected_layer
+                target_action = bpy.data.actions.get(active_layer.action_name) if active_layer.action_name else None
+                if not target_action:
+                    target_action = bpy.data.actions.new(name=f"Act_Sim_{active_layer.name}")
+                ensure_layer_linked(obj, active_layer, is_first=False)
+
+            if active_layer is None:
+                existing_names = {l.name for l in layers}
+                n = 1
+                new_name = "Bake"
+                while new_name in existing_names or bpy.data.actions.get(f"Act_Sim_{new_name}"):
+                    n += 1
+                    new_name = f"Bake {n}"
+                active_layer = layers.add()
+                active_layer.type = 'SIM'
+                active_layer.name = new_name
                 target_action = bpy.data.actions.new(name=f"Act_Sim_{active_layer.name}")
                 active_layer.action_name = target_action.name
-            ensure_layer_linked(obj, active_layer, is_first=False)
+                ensure_layer_linked(obj, active_layer, is_first=False)
+                self._created_layer = True
 
-        if active_layer is None:
-            existing_names = {l.name for l in layers}
-            n = 1
-            new_name = "Bake"
-            while new_name in existing_names or bpy.data.actions.get(f"Act_Sim_{new_name}"):
-                n += 1
-                new_name = f"Bake {n}"
-            # Link the action before touching influence/sim_mix (their
-            # update callback would otherwise create a second action).
-            active_layer = layers.add()
-            active_layer.type = 'SIM'
-            active_layer.name = new_name
-            target_action = bpy.data.actions.new(name=f"Act_Sim_{active_layer.name}")
-            active_layer.action_name = target_action.name
-            ensure_layer_linked(obj, active_layer, is_first=False)
-            self._created_layer = True
+            self._layer_name  = active_layer.name
+            self._action_name = target_action.name
+            obj.wiggle_layer_index = list(layers).index(active_layer)
 
-        # Collection items can move when the collection changes, so keep
-        # names rather than references across modal ticks.
-        self._layer_name  = active_layer.name
-        self._action_name = target_action.name
-        obj.wiggle_layer_index = list(layers).index(active_layer)
+            target_track = _find_track_for_action(obj, target_action)
+            self._target_track_prev_mute = target_track.mute if target_track else None
+            if target_track:
+                target_track.mute = True
 
-        if getattr(w, "bake_nla", False) and obj.animation_data.action:
+        if getattr(w, "bake_nla", False) and obj.animation_data.action and not self._direct_overwrite:
             old_action = obj.animation_data.action
             track = obj.animation_data.nla_tracks.new()
             track.name = "WGL_PrevAction"
             track.strips.new(old_action.name, int(old_action.frame_range[0]), old_action)
             self._created_prev_track_name = track.name
 
-        # Exclude the target layer's own (old) content from the capture.
-        target_track = _find_track_for_action(obj, target_action)
-        self._target_track_prev_mute = target_track.mute if target_track else None
-        if target_track:
-            target_track.mute = True
-
         global _baking_in_progress
         _baking_in_progress = True
-        self._captured = []  # list of (frame, {bone_name: (loc, rot_mode, rot, scale)})
+        self._captured = []
         self._write_started = False
 
         steps = []
@@ -1212,8 +1212,6 @@ class WIGGLE_OT_BakeCombined(ModalBakeMixin, bpy.types.Operator):
                 f"{self._start_frame + val} / {self._end_frame}")
 
     def _bake_can_cancel(self, step):
-        # Once writing starts, the target action has been cleared, so
-        # stopping halfway would leave a half-written bake.
         return step[0] in {'PREROLL', 'CAPTURE'}
 
     def _bake_step(self, context, step):
@@ -1251,30 +1249,31 @@ class WIGGLE_OT_BakeCombined(ModalBakeMixin, bpy.types.Operator):
         elif kind == 'BEGIN_WRITE':
             self._write_started = True
             w.is_preroll = False
-            target_action = bpy.data.actions.get(self._action_name)
-            # Clear now, after capture (a no-op on a brand-new action).
-            _clear_action_keyframes(target_action)
 
-            # Only after capture: make this layer reproduce the bake on its
-            # own (influence 1, no live physics on top). Leaving these
-            # untouched during capture is what keeps the Base+Sim blend.
-            layer = self._layer(obj)
-            if layer:
-                layer.influence = 1.0
-                layer.sim_mix = 0.0
+            if self._direct_overwrite:
+                target_action = self._target_action
+                _clear_action_keyframes(target_action, self._bake_bone_names)
+                obj.animation_data.action = target_action
+            else:
+                target_action = bpy.data.actions.get(self._action_name)
+                _clear_action_keyframes(target_action, self._bake_bone_names)
+                layer = self._layer(obj)
+                if layer:
+                    layer.influence = 1.0
+                    layer.sim_mix = 0.0
 
-            # The influence update re-syncs layers, so mute again here.
-            target_track = _find_track_for_action(obj, target_action)
-            if target_track:
-                target_track.mute = True
+                # The influence update re-syncs layers, so mute again here.
+                target_track = _find_track_for_action(obj, target_action)
+                if target_track:
+                    target_track.mute = True
 
-            # Write straight into the action; no re-evaluation happens
-            # during writing, so the active-action overlay issue can't occur.
-            obj.animation_data.action = target_action
-            if hasattr(obj.animation_data, "action_influence"):
-                obj.animation_data.action_influence = 1.0
-            if hasattr(obj.animation_data, "action_blend_type"):
-                obj.animation_data.action_blend_type = 'REPLACE'
+                # Write straight into the action; no re-evaluation happens
+                # during writing, so the active-action overlay issue can't occur.
+                obj.animation_data.action = target_action
+                if hasattr(obj.animation_data, "action_influence"):
+                    obj.animation_data.action_influence = 1.0
+                if hasattr(obj.animation_data, "action_blend_type"):
+                    obj.animation_data.action_blend_type = 'REPLACE'
 
         elif kind == 'WRITE':
             f, frame_data = self._captured[val]
@@ -1320,15 +1319,17 @@ class WIGGLE_OT_BakeCombined(ModalBakeMixin, bpy.types.Operator):
         scene.wiggle.is_preroll = False
         self._captured = []
         if obj:
-            obj.animation_data.action = None
-            self._restore_track_mute(obj)
+            if not self._direct_overwrite:
+                obj.animation_data.action = None
+                self._restore_track_mute(obj)
             obj.wiggle_freeze = True
         scene.frame_set(self._orig_frame)
-        if obj:
+        if obj and not self._direct_overwrite:
             sync_layers(obj)
         what = (f"{len(self._bake_bone_names)} physics bones (Smart Bake)"
                 if self._smart else "all bones")
-        self.report({'INFO'}, f"Bake Complete into '{self._action_name}' ({what}): "
+        action_name = self._target_action.name if self._direct_overwrite else self._action_name
+        self.report({'INFO'}, f"Bake Complete into '{action_name}' ({what}): "
                               f"{self._start_frame}~{self._end_frame}")
         return {'FINISHED'}
 
@@ -1341,13 +1342,10 @@ class WIGGLE_OT_BakeCombined(ModalBakeMixin, bpy.types.Operator):
         self._captured = []
         obj = self._obj()
         if obj and obj.animation_data:
-            if self._write_started:
-                # Only reachable if writing raised an error (Esc is ignored
-                # during writing); keep what was written, but restore the
-                # normal NLA playback setup.
+            if self._write_started and not self._direct_overwrite:
                 obj.animation_data.action = None
                 self._restore_track_mute(obj)
-            else:
+            elif not self._direct_overwrite:
                 ad = obj.animation_data
                 if self._created_prev_track_name:
                     tr = ad.nla_tracks.get(self._created_prev_track_name)
@@ -1371,7 +1369,7 @@ class WIGGLE_OT_BakeCombined(ModalBakeMixin, bpy.types.Operator):
                 if n:
                     obj.wiggle_layer_index = min(max(self._orig_layer_index, 0), n - 1)
         scene.frame_set(self._orig_frame)
-        if obj:
+        if obj and not self._direct_overwrite:
             sync_layers(obj)
 
 
